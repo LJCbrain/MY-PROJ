@@ -7,7 +7,7 @@ custom_imports = dict(imports=['yolo_world'],
 prompt_budget = 80  # 解决文本类别问题：训练阶段每张图固定 prompt 数，不代表全训练集类别总数
 num_classes = 80
 num_training_classes = prompt_budget
-max_epochs = 50  # Maximum training epochs
+max_epochs = 20  # Maximum training epochs
 close_mosaic_epochs = 2
 save_epoch_intervals = 2
 text_channels = 768
