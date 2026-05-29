@@ -131,7 +131,7 @@ venus_run.sh
 
 # Datasets
 dataset/
-datasets/
+
 data/
 
 # Training outputs
@@ -192,7 +192,7 @@ checkpoints/
 # Datasets
 data/
 dataset/
-datasets/
+
 
 # Training outputs
 runs/
