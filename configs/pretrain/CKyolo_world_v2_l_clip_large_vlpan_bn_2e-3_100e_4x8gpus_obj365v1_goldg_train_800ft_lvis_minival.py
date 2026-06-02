@@ -1,3 +1,5 @@
+import json
+
 _base_ = ('../../third_party/mmyolo/configs/yolov8/'
           'yolov8_l_syncbn_fast_8xb16-500e_coco.py')
 custom_imports = dict(imports=['yolo_world'],
@@ -7,7 +9,7 @@ custom_imports = dict(imports=['yolo_world'],
 prompt_budget = 80  # 解决文本类别问题：训练阶段每张图固定 prompt 数，不代表全训练集类别总数
 num_classes = 80
 num_training_classes = prompt_budget
-max_epochs = 20  # Maximum training epochs
+max_epochs = 30  # Maximum training epochs
 close_mosaic_epochs = 2
 save_epoch_intervals = 2
 text_channels = 768
@@ -27,6 +29,9 @@ model = dict(
     mm_neck=True,
     num_train_classes=num_training_classes,
     num_test_classes=num_classes,
+    loss_fgbg_bce_weight=0.03,
+    loss_fgbg_dice_weight=0.03,
+    loss_fgbg_consistency_weight=0.005,
     data_preprocessor=dict(type='YOLOWDetDataPreprocessor'),
     backbone=dict(
         _delete_=True,
@@ -42,13 +47,15 @@ model = dict(
               guide_channels=text_channels,
               embed_channels=neck_embed_channels,
               num_heads=neck_num_heads,
-              block_cfg=dict(type='MaxSigmoidCSPLayerWithTwoConv'),
+              block_cfg=dict(type='GuideAgnosticCSPLayerWithTwoConv'),
               fgbg_cfg=dict(  # 新增代码：在 neck 内加入类别无关前景门控
                   type='ClassAgnosticForegroundGate',  # 新增代码：只输出 [B,1,H,W] 前景 mask
                   in_channels=[256, 512, _base_.last_stage_out_channels],  # 新增代码：匹配 P3/P4/P5 输出通道
                   hidden_ratio=0.25,  # 新增代码：mask 分支隐藏通道比例
                   min_hidden=16,  # 新增代码：mask 分支最小隐藏通道数
-                  init_gamma=0.0,  # 新增代码：初始等价于原始 neck
+                  init_gamma=0.0,
+                  max_gamma=0.1,
+                  return_parts=True,
               )),
     bbox_head=dict(type='YOLOWorldHead',
                    head_module=dict(type='YOLOWorldHeadModule',
@@ -70,6 +77,10 @@ text_transform = [
          meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'flip',
                     'flip_direction', 'texts'))
 ]
+safe_last_transform = [
+    dict(type='YOLOv5HSVRandomAug'),
+    dict(type='mmdet.RandomFlip', prob=0.5),
+]  # 解决文本类别问题：避开 mmdet.Albu 对 img_path/class_text_path 等元信息 key 的严格检查
 train_pipeline = [
     *_base_.pre_transform,
     dict(type='MultiModalMosaic',
@@ -84,7 +95,7 @@ train_pipeline = [
         max_aspect_ratio=_base_.max_aspect_ratio,
         border=(-img_scale[0] // 2, -img_scale[1] // 2),
         border_val=(114, 114, 114)),
-    *_base_.last_transform[:-1],
+    *safe_last_transform,
     *text_transform,
 ]
 
@@ -103,13 +114,20 @@ train_pipeline_stage2 = [
         scaling_ratio_range=(1 - _base_.affine_scale, 1 + _base_.affine_scale),
         max_aspect_ratio=_base_.max_aspect_ratio,
         border_val=(114, 114, 114)),
-    *_base_.last_transform[:-1],
+    *safe_last_transform,
     *text_transform
 ]
 
 
 # 1. 基础路径设置
 data_root = 'data/LAE-1M'  # 你的数据集根目录
+
+
+def load_class_names(class_text_path):
+    with open(class_text_path, 'r', encoding='utf-8') as f:
+        class_texts = json.load(f)
+    return tuple(text[0] if isinstance(text, list) else text
+                 for text in class_texts)  # 解决文本类别问题：评测 metainfo 使用文本类别顺序，保证 CocoMetric cat_ids 与预测 label 对齐
 
 sub_datasets_info = [
     # ('LAE-COD/AID/images/images', 'LAE-COD/AID/AID.json', 'data/LAE-1M/LAE-COD/AID/AID_categories.json'),
@@ -176,16 +194,20 @@ test_pipeline = [
 ]
 
 
+lae_80c_class_text_path = r'data/LAE-1M/LAE-80C/LAE-80C-benchmark_categories.json'  # 解决文本类别问题：验证文本类别文件统一复用
+lae_80c_classes = load_class_names(lae_80c_class_text_path)  # 解决文本类别问题：显式提供 LAE-80C 的 80 类 metainfo
+
 lae_80c_test_dataset = dict(
     _delete_=True,
     type='MultiModalDataset',
     dataset=dict(type='YOLOv5CocoDataset',
                  data_root=data_root,
                  test_mode=True,
+                 metainfo=dict(classes=lae_80c_classes),
                  ann_file='LAE-80C/LAE-80C-benchmark.json',
                  data_prefix=dict(img='LAE-80C/images/images/'),
-                 batch_shapes_cfg=None),
-    class_text_path=r'data/LAE-1M/LAE-80C/LAE-80C-benchmark_categories.json',
+                 batch_shapes_cfg=None),  # 解决文本类别问题：让 CocoMetric 用 LAE-80C 类名构造 80 个 cat_ids
+    class_text_path=lae_80c_class_text_path,
     pipeline=test_pipeline)
 val_dataloader = dict(dataset=lae_80c_test_dataset)
 test_dataloader = val_dataloader

@@ -31,15 +31,8 @@ class MultiModalDataset:
                 f'but got {dataset}')
 
         self.class_text_path = class_text_path  # 解决文本类别问题：保留文本类别文件路径用于报错定位
-        if class_text_path is not None:  # 若提供了类别文本路径
-            self.class_texts = json.load(open(class_text_path, 'r'))  # 读取 JSON 得到类别文本
-            ori_classes = self.dataset.metainfo.get('classes', None)
-            if ori_classes is not None and len(ori_classes) != len(self.class_texts):
-                raise ValueError(
-                    'Class/text mismatch in MultiModalDataset: '
-                    f'{len(ori_classes)} dataset classes but '
-                    f'{len(self.class_texts)} text entries in '
-                    f'{class_text_path}.')  # 解决文本类别问题：确保数据集类别数和文本类别数一致
+        if class_text_path is not None:
+            self.class_texts = json.load(open(class_text_path, 'r'))
             # ori_classes = self.dataset.metainfo['classes']
             # assert len(ori_classes) == len(self.class_texts), \
             #     ('The number of classes in the dataset and the class text'
@@ -56,38 +49,26 @@ class MultiModalDataset:
             self.full_init()
 
     @property
-    def metainfo(self) -> dict:  # 返回元信息字典
-        return copy.deepcopy(self._metainfo)  # 返回深拷贝，避免外部修改内部状态
+    def metainfo(self) -> dict:
+        return copy.deepcopy(self._metainfo)
 
-    def _validate_class_texts(self) -> None:
-        if self.class_texts is None:
-            return
-        ori_classes = self.dataset.metainfo.get('classes', None)
-        if ori_classes is not None and len(ori_classes) != len(self.class_texts):
-            raise ValueError(
-                'Class/text mismatch in MultiModalDataset: '
-                f'{len(ori_classes)} dataset classes but '
-                f'{len(self.class_texts)} text entries in '
-                f'{self.class_text_path}.')  # 解决文本类别问题：确保 full_init 后数据集类别数和文本类别数一致
-
-    def full_init(self) -> None:  # 完整初始化数据集
-        """``full_init`` dataset."""  # 方法文档：执行 full_init
+    def full_init(self) -> None:
+        """``full_init`` dataset."""
         if self._fully_initialized:
             return
 
-        self.dataset.full_init()  # 调用底层数据集初始化
-        self._validate_class_texts()  # 解决文本类别问题：底层数据集初始化后再次校验类别/text 对齐
-        self._ori_len = len(self.dataset)  # 记录底层数据集原始长度
+        self.dataset.full_init()
+        self._ori_len = len(self.dataset)
         self._fully_initialized = True
 
     @force_full_init
     def get_data_info(self, idx: int) -> dict:
         """Get annotation by index."""
-        data_info = self.dataset.get_data_info(idx)  # 从底层数据集获取 data_info
-        if self.class_texts is not None:  # 若存在类别文本
-            data_info.update({'texts': self.class_texts})  # 注入 texts 字段给后续流程使用
+        data_info = self.dataset.get_data_info(idx)
+        if self.class_texts is not None:
+            data_info.update({'texts': self.class_texts})
             data_info.update({'class_text_path': self.class_text_path})  # 解决文本类别问题：传递文本类别文件路径用于越界报错
-        return data_info  # 返回 data_info
+        return data_info
 
     def __getitem__(self, idx):
         if not self._fully_initialized:
@@ -135,9 +116,9 @@ class MultiModalMixedDataset(MultiModalDataset):
     @force_full_init
     def get_data_info(self, idx: int) -> dict:
         """Get annotation by index."""
-        data_info = self.dataset.get_data_info(idx)  # 从底层数据集获取 data_info
-        if self.class_texts is not None:  # 若存在类别文本
-            data_info.update({'texts': self.class_texts})  # 注入 texts 字段
+        data_info = self.dataset.get_data_info(idx)
+        if self.class_texts is not None:
+            data_info.update({'texts': self.class_texts})
             data_info.update({'class_text_path': self.class_text_path})  # 解决文本类别问题：传递文本类别文件路径用于越界报错
         data_info['is_detection'] = 1 \
             if self.dataset_type == 'detection' else 0

@@ -3,20 +3,22 @@
 
 from .yolo_bricks import (
     CSPLayerWithTwoConv,
+    GuideAgnosticCSPLayerWithTwoConv,
     MaxSigmoidAttnBlock,
     MaxSigmoidCSPLayerWithTwoConv,
     ImagePoolingAttentionModule,
     RepConvMaxSigmoidCSPLayerWithTwoConv,
     RepMaxSigmoidCSPLayerWithTwoConv,
-    ClassAgnosticForegroundGate,  # 新增代码：导入类别无关前景门控模块
+    ClassAgnosticForegroundGate,
+)
 
-    )
-
-__all__ = ['CSPLayerWithTwoConv',
-           'MaxSigmoidAttnBlock',
-           'MaxSigmoidCSPLayerWithTwoConv',
-           'RepConvMaxSigmoidCSPLayerWithTwoConv',
-           'RepMaxSigmoidCSPLayerWithTwoConv',
-           'ImagePoolingAttentionModule',
-           'ClassAgnosticForegroundGate',  # 新增代码：导出类别无关前景门控模块
-           ]
+__all__ = [
+    'CSPLayerWithTwoConv',
+    'GuideAgnosticCSPLayerWithTwoConv',
+    'MaxSigmoidAttnBlock',
+    'MaxSigmoidCSPLayerWithTwoConv',
+    'RepConvMaxSigmoidCSPLayerWithTwoConv',
+    'RepMaxSigmoidCSPLayerWithTwoConv',
+    'ImagePoolingAttentionModule',
+    'ClassAgnosticForegroundGate',
+]

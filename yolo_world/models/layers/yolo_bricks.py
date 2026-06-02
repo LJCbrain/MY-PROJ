@@ -310,6 +310,45 @@ class MaxSigmoidCSPLayerWithTwoConv(CSPLayerWithTwoConv):
 
 
 @MODELS.register_module()
+class GuideAgnosticCSPLayerWithTwoConv(CSPLayerWithTwoConv):
+    """CSP layer that keeps the YOLO-World neck call signature.
+
+    YOLOWorldPAFPN calls each CSP layer as ``layer(x, txt_feats)``. This
+    class intentionally ignores the guide so the neck no longer applies
+    text-image sigmoid attention before foreground recalibration.
+    """
+
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            guide_channels: int = None,
+            embed_channels: int = None,
+            num_heads: int = 1,
+            expand_ratio: float = 0.5,
+            num_blocks: int = 1,
+            with_scale: bool = False,
+            add_identity: bool = True,
+            conv_cfg: OptConfigType = None,
+            norm_cfg: ConfigType = dict(type='BN', momentum=0.03, eps=0.001),
+            act_cfg: ConfigType = dict(type='SiLU', inplace=True),
+            init_cfg: OptMultiConfig = None,
+            use_einsum: bool = True) -> None:
+        super().__init__(in_channels=in_channels,
+                         out_channels=out_channels,
+                         expand_ratio=expand_ratio,
+                         num_blocks=num_blocks,
+                         add_identity=add_identity,
+                         conv_cfg=conv_cfg,
+                         norm_cfg=norm_cfg,
+                         act_cfg=act_cfg,
+                         init_cfg=init_cfg)
+
+    def forward(self, x: Tensor, guide: Tensor = None) -> Tensor:
+        return super().forward(x)
+
+
+@MODELS.register_module()
 class RepMaxSigmoidCSPLayerWithTwoConv(CSPLayerWithTwoConv):
     """Sigmoid-attention based CSP layer with two convolution layers."""
 
@@ -609,7 +648,9 @@ class ClassAgnosticForegroundGate(BaseModule):  # 新增代码：neck 内使用�
                  in_channels: List[int],  # 新增代码：每个输出尺度的通道数
                  hidden_ratio: float = 0.25,  # 新增代码：mask 分支隐藏通道比例
                  min_hidden: int = 16,  # 新增代码：mask 分支最小隐藏通道数
-                 init_gamma: float = 0.01,  # 新增代码：残差门控初始强度
+                 init_gamma: float = 0.0,  # 新增代码：残差门控初始强度
+                 max_gamma: float = 0.1,
+                 return_parts: bool = True,
                  norm_cfg: ConfigType = dict(type='BN',  # 新增代码：BN 类型
                                              momentum=0.03,  # 新增代码：BN momentum
                                              eps=0.001),  # 新增代码：沿用项目 BN 配置
@@ -617,6 +658,8 @@ class ClassAgnosticForegroundGate(BaseModule):  # 新增代码：neck 内使用�
                                             inplace=True),  # 新增代码：沿用项目激活配置
                  init_cfg: OptMultiConfig = None) -> None:  # 新增代码：兼容 BaseModule 初始化
         super().__init__(init_cfg=init_cfg)  # 新增代码：初始化 BaseModule
+        self.max_gamma = max_gamma
+        self.return_parts = return_parts
         self.mask_convs = nn.ModuleList()  # 新增代码：保存各尺度 mask 预测分支
         self.gammas = nn.ParameterList()  # 新增代码：保存各尺度可学习残差门控强度
 
@@ -638,30 +681,28 @@ class ClassAgnosticForegroundGate(BaseModule):  # 新增代码：neck 内使用�
                 feats,  # 新增代码：输入 tuple/list 多尺度特征
                 txt_feats=None,  # 新增代码：保留文本接口，第一阶段不使用
                 txt_masks=None,  # 新增代码：保留文本 mask 接口，第一阶段不使用
-                return_parts: bool = False):  # 新增代码：是否返回 mask/fg/bg 调试信息
+                return_parts: bool = None):  # 新增代码：是否返回 mask/fg/bg 调试信息
         """Forward multi-level features without producing class logits."""  # 新增代码：强调不做分类
         assert len(feats) == len(self.mask_convs)  # 新增代码：确保尺度数量匹配
+        if return_parts is None:
+            return_parts = self.return_parts
         out_feats = []  # 新增代码：保存门控后的特征
         masks = []  # 新增代码：保存类别无关前景 mask
-        fg_feats = []  # 新增代码：保存前景分量，供后续可视化或辅助 loss 使用
-        bg_feats = []  # 新增代码：保存背景分量，供后续可视化或辅助 loss 使用
+        gammas = []
 
         for feat, mask_conv, gamma in zip(feats, self.mask_convs, self.gammas):  # 新增代码：逐尺度处理
             logit = mask_conv(feat)  # 新增代码：预测 [B,1,H,W] 类别无关前景 logit
             mask = torch.sigmoid(logit)  # 新增代码：得到类别无关前景 mask
-            fg = feat * mask  # 新增代码：提取前景增强分量
-            bg = feat * (1.0 - mask)  # 新增代码：提取背景分量
-            out = feat + gamma * fg  # 新增代码：残差门控，保持 head 输入通道不变
+            gamma = torch.clamp(gamma, 0.0, self.max_gamma)
+            out = feat * (1.0 + gamma * mask)  # 温和前景重标定，不硬抑制背景
 
             out_feats.append(out)  # 新增代码：收集当前尺度输出
             masks.append(mask)  # 新增代码：收集当前尺度 mask
-            fg_feats.append(fg)  # 新增代码：收集当前尺度前景特征
-            bg_feats.append(bg)  # 新增代码：收集当前尺度背景特征
+            gammas.append(gamma)
 
         out_feats = tuple(out_feats)  # 新增代码：保持 neck 输出为 tuple[Tensor]
         if return_parts:  # 新增代码：可选返回调试信息，不传给 head
             return out_feats, dict(masks=masks,  # 新增代码：返回 mask 列表
-                                   fg_feats=fg_feats,  # 新增代码：返回前景特征列表
-                                   bg_feats=bg_feats)  # 新增代码：返回背景特征列表
+                                   gammas=gammas)  # 返回各尺度有效 gamma
         return out_feats  # 新增代码：默认只返回 tuple[Tensor]
 
