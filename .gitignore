@@ -192,8 +192,12 @@ checkpoints/
 # Datasets
 data/
 dataset/
-
-
+data/LAE-1M
+data/LAE-1M/LAE-80C
+data/LAE-1M/LAE-COD
+data/LAE-1M/LAE-FOD
+data/LAE-1M/.gitattributes
+data/LAE-1M/README.md
 # Training outputs
 runs/
 outputs/
