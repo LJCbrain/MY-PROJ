@@ -62,7 +62,6 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                  frozen_modules: Sequence[str] = (),
                  dropout: float = 0.0,
                  add_mask: bool = False,
-                 pad_value: str = '',
                  training_use_cache: bool = False,
                  init_cfg: OptMultiConfig = None) -> None:
 
@@ -71,7 +70,6 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         self.frozen_modules = frozen_modules
         self.training_use_cache = training_use_cache
         self.add_mask = add_mask
-        self.pad_value = pad_value  # 解决文本类别问题：为 padding prompt 生成 mask
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         clip_config = CLIPTextConfig.from_pretrained(model_name,
                                                      attention_dropout=dropout)
@@ -92,7 +90,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         text = list(itertools.chain(*text))
         if self.add_mask:
             text_mask = torch.tensor([x != self.pad_value for x in text],
-                                     requires_grad=False).to(self.model.device)  # 解决文本类别问题：标记有效 prompt 与 padding prompt
+                                     requires_grad=False).to(self.model.device)
         text = self.tokenizer(text=text, return_tensors='pt', padding=True)
         text = text.to(device=self.model.device)
 
@@ -109,7 +107,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         txt_feats = txt_feats.reshape(-1, num_per_batch[0],
                                       txt_feats.shape[-1])
         if self.add_mask:
-            text_mask = text_mask.reshape(-1, num_per_batch[0]).to(txt_feats)  # 解决文本类别问题：返回与文本特征对齐的 mask
+            text_mask = text_mask.reshape(-1, num_per_batch[0]).to(txt_feats)
         else:
             text_mask = None
         return txt_feats, text_mask

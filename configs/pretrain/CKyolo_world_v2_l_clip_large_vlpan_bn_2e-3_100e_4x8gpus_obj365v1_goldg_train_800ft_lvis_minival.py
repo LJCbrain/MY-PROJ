@@ -1,14 +1,12 @@
-import json
-
 _base_ = ('../../third_party/mmyolo/configs/yolov8/'
           'yolov8_l_syncbn_fast_8xb16-500e_coco.py')
 custom_imports = dict(imports=['yolo_world'],
                       allow_failed_imports=False)
 
 # hyper-parameters
-prompt_budget = 80  # 解决文本类别问题：训练阶段每张图固定 prompt 数，不代表全训练集类别总数
+
 num_classes = 80
-num_training_classes = prompt_budget
+num_training_classes =38
 max_epochs = 30  # Maximum training epochs
 close_mosaic_epochs = 2
 save_epoch_intervals = 2
@@ -72,15 +70,11 @@ text_transform = [
          max_num_samples=num_training_classes,
          padding_to_max=True,
          padding_value=''),
-    #
     dict(type='mmdet.PackDetInputs',
          meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'flip',
                     'flip_direction', 'texts'))
 ]
-safe_last_transform = [
-    dict(type='YOLOv5HSVRandomAug'),
-    dict(type='mmdet.RandomFlip', prob=0.5),
-]  # 解决文本类别问题：避开 mmdet.Albu 对 img_path/class_text_path 等元信息 key 的严格检查
+
 train_pipeline = [
     *_base_.pre_transform,
     dict(type='MultiModalMosaic',
@@ -95,7 +89,7 @@ train_pipeline = [
         max_aspect_ratio=_base_.max_aspect_ratio,
         border=(-img_scale[0] // 2, -img_scale[1] // 2),
         border_val=(114, 114, 114)),
-    *safe_last_transform,
+    *_base_.last_transform[:-1],
     *text_transform,
 ]
 
@@ -114,7 +108,7 @@ train_pipeline_stage2 = [
         scaling_ratio_range=(1 - _base_.affine_scale, 1 + _base_.affine_scale),
         max_aspect_ratio=_base_.max_aspect_ratio,
         border_val=(114, 114, 114)),
-    *safe_last_transform,
+    *_base_.last_transform[:-1],
     *text_transform
 ]
 
@@ -122,12 +116,6 @@ train_pipeline_stage2 = [
 # 1. 基础路径设置
 data_root = 'data/LAE-1M'  # 你的数据集根目录
 
-
-def load_class_names(class_text_path):
-    with open(class_text_path, 'r', encoding='utf-8') as f:
-        class_texts = json.load(f)
-    return tuple(text[0] if isinstance(text, list) else text
-                 for text in class_texts)  # 解决文本类别问题：评测 metainfo 使用文本类别顺序，保证 CocoMetric cat_ids 与预测 label 对齐
 
 sub_datasets_info = [
     # ('LAE-COD/AID/images/images', 'LAE-COD/AID/AID.json', 'data/LAE-1M/LAE-COD/AID/AID_categories.json'),
@@ -148,7 +136,6 @@ sub_datasets_info = [
 # 3. 构建数据集配置列表
 train_dataset_list = []
 for img_path, ann_path, class_text_path in sub_datasets_info:
-
     train_dataset_list.append(
         dict(
             type='MultiModalDataset',
@@ -194,8 +181,7 @@ test_pipeline = [
 ]
 
 
-lae_80c_class_text_path = r'data/LAE-1M/LAE-80C/LAE-80C-benchmark_categories.json'  # 解决文本类别问题：验证文本类别文件统一复用
-lae_80c_classes = load_class_names(lae_80c_class_text_path)  # 解决文本类别问题：显式提供 LAE-80C 的 80 类 metainfo
+
 
 lae_80c_test_dataset = dict(
     _delete_=True,
@@ -203,11 +189,10 @@ lae_80c_test_dataset = dict(
     dataset=dict(type='YOLOv5CocoDataset',
                  data_root=data_root,
                  test_mode=True,
-                 metainfo=dict(classes=lae_80c_classes),
                  ann_file='LAE-80C/LAE-80C-benchmark.json',
                  data_prefix=dict(img='LAE-80C/images/images/'),
                  batch_shapes_cfg=None),  # 解决文本类别问题：让 CocoMetric 用 LAE-80C 类名构造 80 个 cat_ids
-    class_text_path=lae_80c_class_text_path,
+    class_text_path=r'data/LAE-1M/LAE-80C/LAE-80C-benchmark_categories.json',
     pipeline=test_pipeline)
 val_dataloader = dict(dataset=lae_80c_test_dataset)
 test_dataloader = val_dataloader

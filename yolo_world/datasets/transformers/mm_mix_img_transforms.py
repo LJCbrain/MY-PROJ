@@ -100,14 +100,6 @@ class BaseMultiModalMixImageTransform(BaseTransform, metaclass=ABCMeta):
 
         for res in [results] + results['mix_results']:
             for i, label in enumerate(res['gt_bboxes_labels']):
-                if int(label) < 0 or int(label) >= len(res['texts']):
-                    img_path = res.get('img_path', '<unknown>')
-                    class_text_path = res.get('class_text_path', '<unknown>')
-                    raise ValueError(
-                        'Label/text mismatch in multimodal mix transform: '
-                        f'label {int(label)} is outside the text range '
-                        f'[0, {len(res["texts"]) - 1}] for image {img_path}; '
-                        f'class_text_path={class_text_path}.')  # 解决文本类别问题：防止 mosaic 阶段文本索引越界
                 text = res['texts'][label]
                 updated_id = text2id[tuple(text)]
                 res['gt_bboxes_labels'][i] = updated_id

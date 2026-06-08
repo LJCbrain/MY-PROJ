@@ -45,30 +45,13 @@ class RandomLoadText:
             gt_label_tag = 'gt_bboxes_labels'
         else:
             raise ValueError('No valid labels found in results.')
-        positive_labels = {int(label) for label in results[gt_label_tag]}
-        out_of_range_labels = sorted(
-            label for label in positive_labels
-            if label < 0 or label >= num_classes)  # 解决文本类别问题：按当前子数据集文本长度检查 label
-        if out_of_range_labels:
-            img_path = results.get('img_path', '<unknown>')
-            class_text_path = results.get('class_text_path', '<unknown>')
-            raise ValueError(
-                'Label/text mismatch in RandomLoadText: '
-                f'labels {out_of_range_labels[:10]} are outside the text '
-                f'range [0, {num_classes - 1}] for image {img_path}; '
-                f'class_text_path={class_text_path}.')
-
+        positive_labels = set(results[gt_label_tag])
         if len(positive_labels) > self.max_num_samples:
-            img_path = results.get('img_path', '<unknown>')
-            raise ValueError(
-                'Too many positive labels in RandomLoadText: '
-                f'{len(positive_labels)} positives exceed max_num_samples='
-                f'{self.max_num_samples} for image {img_path}.')  # 解决文本类别问题：正类必须优先保留，不能静默丢弃
-
+            positive_labels = set(random.sample(list(positive_labels),
+                                                k=self.max_num_samples))
         num_neg_samples = min(
             min(num_classes, self.max_num_samples) - len(positive_labels),
             random.randint(*self.num_neg_samples))
-        num_neg_samples = max(num_neg_samples, 0)
         candidate_neg_labels = []
         for idx in range(num_classes):
             if idx not in positive_labels:
@@ -110,7 +93,7 @@ class RandomLoadText:
             num_valid_labels = len(positive_labels) + len(negative_labels)
             num_padding = self.max_num_samples - num_valid_labels
             if num_padding > 0:
-                texts += [self.padding_value] * num_padding  # 解决文本类别问题：小类别数据集 padding 到固定 prompt 数
+                texts += [self.padding_value] * num_padding
 
         results['texts'] = texts
 

@@ -30,7 +30,6 @@ class MultiModalDataset:
                 'dataset must be a dict or a BaseDataset, '
                 f'but got {dataset}')
 
-        self.class_text_path = class_text_path  # 解决文本类别问题：保留文本类别文件路径用于报错定位
         if class_text_path is not None:
             self.class_texts = json.load(open(class_text_path, 'r'))
             # ori_classes = self.dataset.metainfo['classes']
@@ -67,7 +66,6 @@ class MultiModalDataset:
         data_info = self.dataset.get_data_info(idx)
         if self.class_texts is not None:
             data_info.update({'texts': self.class_texts})
-            data_info.update({'class_text_path': self.class_text_path})  # 解决文本类别问题：传递文本类别文件路径用于越界报错
         return data_info
 
     def __getitem__(self, idx):
@@ -119,7 +117,6 @@ class MultiModalMixedDataset(MultiModalDataset):
         data_info = self.dataset.get_data_info(idx)
         if self.class_texts is not None:
             data_info.update({'texts': self.class_texts})
-            data_info.update({'class_text_path': self.class_text_path})  # 解决文本类别问题：传递文本类别文件路径用于越界报错
         data_info['is_detection'] = 1 \
             if self.dataset_type == 'detection' else 0
         return data_info
