@@ -38,9 +38,7 @@ model = dict(
         text_model=dict(
             type='HuggingCLIPLanguageBackbone',
             model_name=text_model_name,
-            frozen_modules=['all'],
-            add_mask=True,  # 解决文本类别问题：启用 padding prompt 的文本 mask
-            pad_value='')),  # 解决文本类别问题：统一用空字符串作为 padding prompt
+            frozen_modules=['all'],)),
     neck=dict(type='YOLOWorldPAFPN',
               guide_channels=text_channels,
               embed_channels=neck_embed_channels,
