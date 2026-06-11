@@ -167,17 +167,34 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             batch_inputs, batch_data_samples)  # 传入图像和样本元信息
 
         # self.bbox_head.num_classes = self.num_test_classes  # 原始逻辑：将类别数设为预定义测试类别数（目前注释掉）
-        self.bbox_head.num_classes = txt_feats[0].shape[0]  # 根据当前文本特征的类别维度动态设�?num_classes
+        current_num_classes = (
+            txt_feats.shape[1] if txt_feats.dim() == 3 else txt_feats.shape[0])
+        self.bbox_head.num_classes = current_num_classes  # solve text category issue: infer test classes from current text features  # 根据当前文本特征的类别维度动态设�?num_classes
         results_list = self.bbox_head.predict(img_feats,  # 使用检测头进行预测
                                               txt_feats,  # 文本特征作为分类参�?
                                               txt_masks,  # 文本 mask，标记有效文�?
                                               batch_data_samples,  # 样本元信�?
-                                              rescale=rescale)  # 是否对输出框进行尺度还原
+                                              rescale=rescale)
+        self._check_pred_label_range(results_list, current_num_classes)  # solve text category issue: stop invalid labels before CocoMetric  # 是否对输出框进行尺度还原
 
         batch_data_samples = self.add_pred_to_datasample(  # 将预测结果写回到 batch_data_samples �?
             batch_data_samples, results_list)  # 传入原始样本信息和预测列�?
         return batch_data_samples  # 返回包含预测结果的样本列�?
 
+    @staticmethod
+    def _check_pred_label_range(results_list: list, num_texts: int) -> None:
+        """Ensure predicted labels can index the current inference texts."""
+        for img_idx, pred_instances in enumerate(results_list):
+            labels = getattr(pred_instances, 'labels', None)
+            if labels is None or labels.numel() == 0:
+                continue
+            max_label = int(labels.max().item())
+            min_label = int(labels.min().item())
+            if min_label < 0 or max_label >= num_texts:
+                raise IndexError(
+                    'Prediction label/text mismatch: '
+                    f'image_index={img_idx}, label_range='
+                    f'[{min_label}, {max_label}], text_count={num_texts}.')
     def reparameterize(self, texts: List[List[str]]) -> None:  # 重新参数化函数，将文本编码为特征并缓�?
         # encode text embeddings into the detector  # 注释：将文本嵌入编码并缓存到检测器�?
         self.texts = texts  # 缓存文本字符串列�?

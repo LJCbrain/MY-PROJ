@@ -30,6 +30,7 @@ class MultiModalDataset:
                 'dataset must be a dict or a BaseDataset, '
                 f'but got {dataset}')
 
+        self.class_text_path = class_text_path
         if class_text_path is not None:
             self.class_texts = json.load(open(class_text_path, 'r'))
             # ori_classes = self.dataset.metainfo['classes']
@@ -66,6 +67,7 @@ class MultiModalDataset:
         data_info = self.dataset.get_data_info(idx)
         if self.class_texts is not None:
             data_info.update({'texts': self.class_texts})
+            data_info.update({'class_text_path': self.class_text_path})  # solve text category issue: keep text source for range-error diagnostics
         return data_info
 
     def __getitem__(self, idx):
@@ -117,6 +119,7 @@ class MultiModalMixedDataset(MultiModalDataset):
         data_info = self.dataset.get_data_info(idx)
         if self.class_texts is not None:
             data_info.update({'texts': self.class_texts})
+            data_info.update({'class_text_path': self.class_text_path})  # solve text category issue: keep text source for range-error diagnostics
         data_info['is_detection'] = 1 \
             if self.dataset_type == 'detection' else 0
         return data_info

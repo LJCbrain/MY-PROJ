@@ -92,6 +92,9 @@ class BaseMultiModalMixImageTransform(BaseTransform, metaclass=ABCMeta):
         if 'texts' not in results:
             return results
 
+        for res in [results] + results['mix_results']:
+            self._check_label_text_range(res, 'before multimodal mix')  # solve text category issue: catch invalid labels before text remap
+
         mix_texts = sum(
             [results['texts']] +
             [x['texts'] for x in results['mix_results']], [])
@@ -104,7 +107,31 @@ class BaseMultiModalMixImageTransform(BaseTransform, metaclass=ABCMeta):
                 updated_id = text2id[tuple(text)]
                 res['gt_bboxes_labels'][i] = updated_id
             res['texts'] = mix_texts
+            self._check_label_text_range(res, 'after multimodal mix')  # solve text category issue: ensure remapped labels index merged texts
         return results
+
+    @staticmethod
+    def _check_label_text_range(results: dict, stage: str) -> None:
+        """Ensure labels are valid indexes of the active text list."""
+        labels = results.get('gt_bboxes_labels', None)
+        texts = results.get('texts', None)
+        if labels is None or texts is None:
+            return
+        num_texts = len(texts)
+        invalid_labels = sorted({
+            int(label)
+            for label in labels
+            if int(label) < 0 or int(label) >= num_texts
+        })
+        if not invalid_labels:
+            return
+        img_path = results.get('img_path', '<unknown>')
+        class_text_path = results.get('class_text_path', '<unknown>')
+        raise ValueError(
+            'Label/text mismatch in multimodal mix transform: '
+            f'labels {invalid_labels[:10]} are outside the active text '
+            f'range [0, {num_texts - 1}] {stage} for image {img_path}. '
+            f'class_text_path={class_text_path}.')
 
     @autocast_box_type()
     def transform(self, results: dict) -> dict:

@@ -21,15 +21,42 @@ class RandomLoadText:
                  num_neg_samples: Tuple[int, int] = (80, 80),
                  max_num_samples: int = 80,
                  padding_to_max: bool = False,
-                 padding_value: str = '') -> None:
+                 padding_value: str = '',
+                 validate_label_range: bool = True,
+                 invalid_label_policy: str = 'error') -> None:
         self.prompt_format = prompt_format
         self.num_neg_samples = num_neg_samples
         self.max_num_samples = max_num_samples
         self.padding_to_max = padding_to_max
         self.padding_value = padding_value
+        self.validate_label_range = validate_label_range
+        self.invalid_label_policy = invalid_label_policy
+        if self.invalid_label_policy != 'error':
+            raise ValueError(
+                "RandomLoadText only supports invalid_label_policy='error'.")
         if text_path is not None:
             with open(text_path, 'r') as f:
                 self.class_texts = json.load(f)
+
+    @staticmethod
+    def _check_label_range(results: dict, gt_label_tag: str,
+                           num_classes: int) -> None:
+        invalid_labels = sorted({
+            int(label)
+            for label in results[gt_label_tag]
+            if int(label) < 0 or int(label) >= num_classes
+        })
+        if not invalid_labels:
+            return
+
+        img_path = results.get('img_path', '<unknown>')
+        class_text_path = results.get('class_text_path', '<unknown>')
+        raise ValueError(
+            'Label/text mismatch in RandomLoadText: '
+            f'labels {invalid_labels[:10]} are outside the local text '
+            f'range [0, {num_classes - 1}] for image {img_path}. '
+            f'class_text_path={class_text_path}. '
+            'Each training label must index the current sample texts.')
 
     def __call__(self, results: dict) -> dict:
         assert 'texts' in results or hasattr(self, 'class_texts'), (
@@ -45,6 +72,8 @@ class RandomLoadText:
             gt_label_tag = 'gt_bboxes_labels'
         else:
             raise ValueError('No valid labels found in results.')
+        if self.validate_label_range:
+            self._check_label_range(results, gt_label_tag, num_classes)  # solve text category issue: labels must index the active local text list
         positive_labels = set(results[gt_label_tag])
         if len(positive_labels) > self.max_num_samples:
             positive_labels = set(random.sample(list(positive_labels),

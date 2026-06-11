@@ -1,3 +1,5 @@
+import json
+
 _base_ = ('../../third_party/mmyolo/configs/yolov8/'
           'yolov8_l_syncbn_fast_8xb16-500e_coco.py')
 custom_imports = dict(imports=['yolo_world'],
@@ -6,6 +8,7 @@ custom_imports = dict(imports=['yolo_world'],
 # hyper-parameters
 
 num_classes = 80
+num_test_classes = num_classes
 num_training_classes =38
 max_epochs = 30  # Maximum training epochs
 close_mosaic_epochs = 2
@@ -26,7 +29,7 @@ model = dict(
     type='YOLOWorldDetector',  # 新增代码：使用当前真实存在的 detector，前景门控放到 neck 中
     mm_neck=True,
     num_train_classes=num_training_classes,
-    num_test_classes=num_classes,
+    num_test_classes=num_test_classes,
     loss_fgbg_bce_weight=0.03,
     loss_fgbg_dice_weight=0.03,
     loss_fgbg_consistency_weight=0.005,
@@ -178,6 +181,11 @@ test_pipeline = [
                     'scale_factor', 'pad_param', 'texts'))
 ]
 
+lae_80c_class_text_path = r'data/LAE-1M/LAE-80C/LAE-80C-benchmark_categories.json'
+lae_80c_classes = tuple(
+    item[0] for item in json.loads(
+        open(lae_80c_class_text_path, 'r', encoding='utf-8').read()))  # solve text category issue: align LAE-80C evaluator classes with test texts
+
 
 
 
@@ -185,12 +193,13 @@ lae_80c_test_dataset = dict(
     _delete_=True,
     type='MultiModalDataset',
     dataset=dict(type='YOLOv5CocoDataset',
+                 metainfo=dict(classes=lae_80c_classes),  # solve text category issue: build 80 LAE-80C cat_ids for CocoMetric
                  data_root=data_root,
                  test_mode=True,
                  ann_file='LAE-80C/LAE-80C-benchmark.json',
                  data_prefix=dict(img='LAE-80C/images/images/'),
                  batch_shapes_cfg=None),  # 解决文本类别问题：让 CocoMetric 用 LAE-80C 类名构造 80 个 cat_ids
-    class_text_path=r'data/LAE-1M/LAE-80C/LAE-80C-benchmark_categories.json',
+    class_text_path=lae_80c_class_text_path,
     pipeline=test_pipeline)
 val_dataloader = dict(dataset=lae_80c_test_dataset)
 test_dataloader = val_dataloader
@@ -220,7 +229,7 @@ custom_hooks = [
          switch_pipeline=train_pipeline_stage2)
 ]
 train_cfg = dict(max_epochs=max_epochs,
-                 val_interval=5,
+                 val_interval=3,
                  dynamic_intervals=[((max_epochs - close_mosaic_epochs),
                                      _base_.val_interval_stage2)])
 visualizer = dict(
