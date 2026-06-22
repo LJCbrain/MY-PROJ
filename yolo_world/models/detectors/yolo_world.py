@@ -1,6 +1,6 @@
 # Copyright (c) Tencent Inc. All rights reserved.  # 版权声明
 
-from typing import List, Tuple, Union  # �?typing 导入类型注解工具
+from typing import List, Optional, Tuple, Union  # �?typing 导入类型注解工具
 import torch  # 导入 PyTorch 主包
 import torch.nn as nn  # 导入 PyTorch 神经网络模块并简写为 nn
 import torch.nn.functional as F
@@ -20,13 +20,21 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
                  num_test_classes=80,  # 测试阶段类别�?
                  loss_fgbg_bce_weight: float = 0.0,
                  loss_fgbg_dice_weight: float = 0.0,
+                 loss_fgbg_mask_bce_weight: Optional[float] = None,
+                 loss_fgbg_mask_dice_weight: Optional[float] = None,
+                 loss_fgbg_quality_weight: float = 0.0,
                  loss_fgbg_consistency_weight: float = 0.0,
                  **kwargs) -> None:  # 关键字参数，透传给父�?/-> None 表示这个函数不会返回任何有意义的�?
         self.mm_neck = mm_neck  # 保存是否使用多模�?neck 的配�?
         self.num_train_classes = num_train_classes  # 保存训练类别�?
         self.num_test_classes = num_test_classes  # 保存测试类别�?
-        self.loss_fgbg_bce_weight = loss_fgbg_bce_weight
-        self.loss_fgbg_dice_weight = loss_fgbg_dice_weight
+        self.loss_fgbg_mask_bce_weight = (
+            loss_fgbg_bce_weight if loss_fgbg_mask_bce_weight is None else
+            loss_fgbg_mask_bce_weight)
+        self.loss_fgbg_mask_dice_weight = (
+            loss_fgbg_dice_weight if loss_fgbg_mask_dice_weight is None else
+            loss_fgbg_mask_dice_weight)
+        self.loss_fgbg_quality_weight = loss_fgbg_quality_weight
         self.loss_fgbg_consistency_weight = loss_fgbg_consistency_weight
         super().__init__(*args, **kwargs)  # 调用父类构造函数完成基础初始�?
 
@@ -44,7 +52,7 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
 
     def _loss_fgbg(self, batch_inputs: Tensor,
                    batch_data_samples: SampleList) -> dict:
-        """Compute class-agnostic foreground auxiliary losses for training."""
+        """Compute class-agnostic objectness recalibration losses."""
         if not self.with_neck or not hasattr(self.neck, '_fgbg_parts'):
             return {}
         fgbg_parts = self.neck._fgbg_parts
@@ -54,33 +62,53 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
         pred_masks = fgbg_parts['masks']
         if len(pred_masks) == 0:
             return {}
+        pred_qualities = fgbg_parts.get('qualities', None)
+        pred_recalib_maps = fgbg_parts.get('recalib_maps', pred_masks)
 
         input_shape = batch_inputs.shape[-2:]
+        batch_size = batch_inputs.shape[0]
         target_masks = [
             self._build_bbox_pseudo_masks(batch_data_samples, mask.shape[-2:],
-                                          input_shape, batch_inputs.shape[0],
+                                          input_shape, batch_size,
                                           mask.device, mask.dtype)
             for mask in pred_masks
         ]
 
         losses = {}
-        if self.loss_fgbg_bce_weight > 0:
+        if self.loss_fgbg_mask_bce_weight > 0:
             bce_loss = sum(
                 F.binary_cross_entropy(mask, target)
                 for mask, target in zip(pred_masks, target_masks))
-            losses['loss_fgbg_bce'] = (
-                bce_loss / len(pred_masks) * self.loss_fgbg_bce_weight)
+            losses['loss_fgbg_mask_bce'] = (
+                bce_loss / len(pred_masks) * self.loss_fgbg_mask_bce_weight)
 
-        if self.loss_fgbg_dice_weight > 0:
+        if self.loss_fgbg_mask_dice_weight > 0:
             dice_loss = sum(
                 self._dice_loss(mask, target)
                 for mask, target in zip(pred_masks, target_masks))
-            losses['loss_fgbg_dice'] = (
-                dice_loss / len(pred_masks) * self.loss_fgbg_dice_weight)
+            losses['loss_fgbg_mask_dice'] = (
+                dice_loss / len(pred_masks) * self.loss_fgbg_mask_dice_weight)
 
-        if self.loss_fgbg_consistency_weight > 0 and len(pred_masks) > 1:
+        if (self.loss_fgbg_quality_weight > 0 and pred_qualities is not None
+                and len(pred_qualities) > 0):
+            quality_targets = [
+                self._build_bbox_quality_maps(batch_data_samples,
+                                              quality.shape[-2:], input_shape,
+                                              batch_size, quality.device,
+                                              quality.dtype)
+                for quality in pred_qualities
+            ]
+            quality_loss = sum(
+                F.smooth_l1_loss(quality, target)
+                for quality, target in zip(pred_qualities, quality_targets))
+            losses['loss_fgbg_quality'] = (
+                quality_loss / len(pred_qualities) *
+                self.loss_fgbg_quality_weight)
+
+        if (self.loss_fgbg_consistency_weight > 0 and
+                len(pred_recalib_maps) > 1):
             consistency = 0.0
-            for src, dst in zip(pred_masks[:-1], pred_masks[1:]):
+            for src, dst in zip(pred_recalib_maps[:-1], pred_recalib_maps[1:]):
                 src = F.interpolate(
                     src,
                     size=dst.shape[-2:],
@@ -88,49 +116,41 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
                     align_corners=False)
                 consistency = consistency + F.l1_loss(src, dst.detach())
             losses['loss_fgbg_consistency'] = (
-                consistency / (len(pred_masks) - 1) *
+                consistency / (len(pred_recalib_maps) - 1) *
                 self.loss_fgbg_consistency_weight)
 
         return losses
 
-    def _build_bbox_pseudo_masks(self, batch_data_samples: SampleList,
-                                 feat_shape: Tuple[int, int],
-                                 input_shape: Tuple[int, int],
-                                 batch_size: int,
-                                 device: torch.device,
-                                 dtype: torch.dtype) -> Tensor:
-        """Rasterize GT boxes into feature-level class-agnostic masks."""
+    def _collect_scaled_boxes(self, batch_data_samples: SampleList,
+                              input_shape: Tuple[int, int],
+                              feat_shape: Tuple[int, int],
+                              batch_size: int, device: torch.device,
+                              dtype: torch.dtype) -> List[Tuple[int, Tensor]]:
+        """Collect GT boxes scaled to the feature-map coordinate system."""
         feat_h, feat_w = feat_shape
         input_h, input_w = input_shape
-        masks = torch.zeros(
-            (batch_size, 1, feat_h, feat_w),
-            device=device,
-            dtype=dtype)
-
         scale_x = feat_w / max(float(input_w), 1.0)
         scale_y = feat_h / max(float(input_h), 1.0)
+        scaled_boxes = []
 
         if isinstance(batch_data_samples, dict):
             bboxes_labels = batch_data_samples.get('bboxes_labels', None)
             if bboxes_labels is None or bboxes_labels.numel() == 0:
-                return masks
+                return scaled_boxes
             bboxes_labels = bboxes_labels.to(device=device, dtype=dtype)
             batch_indices = bboxes_labels[:, 0].long()
             boxes = bboxes_labels[:, 2:6].clone()
             boxes[:, 0::2] = boxes[:, 0::2] * scale_x
             boxes[:, 1::2] = boxes[:, 1::2] * scale_y
-            x1 = boxes[:, 0].floor().clamp(0, feat_w - 1).long()
-            y1 = boxes[:, 1].floor().clamp(0, feat_h - 1).long()
-            x2 = boxes[:, 2].ceil().clamp(1, feat_w).long()
-            y2 = boxes[:, 3].ceil().clamp(1, feat_h).long()
-            for batch_idx, left, top, right, bottom in zip(
-                    batch_indices, x1, y1, x2, y2):
-                if 0 <= batch_idx < batch_size and right > left and bottom > top:
-                    masks[batch_idx, 0, top:bottom, left:right] = 1.0
-            return masks
+            for batch_idx in range(batch_size):
+                keep = batch_indices == batch_idx
+                if keep.any():
+                    scaled_boxes.append((batch_idx, boxes[keep]))
+            return scaled_boxes
 
         for batch_idx, data_sample in enumerate(batch_data_samples):
-            if not hasattr(data_sample, 'gt_instances'):
+            if batch_idx >= batch_size or not hasattr(data_sample,
+                                                      'gt_instances'):
                 continue
             bboxes = data_sample.gt_instances.bboxes
             if len(bboxes) == 0:
@@ -139,14 +159,94 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             boxes = boxes.to(device=device, dtype=dtype).clone()
             boxes[:, 0::2] = boxes[:, 0::2] * scale_x
             boxes[:, 1::2] = boxes[:, 1::2] * scale_y
-            x1 = boxes[:, 0].floor().clamp(0, feat_w - 1).long()
-            y1 = boxes[:, 1].floor().clamp(0, feat_h - 1).long()
-            x2 = boxes[:, 2].ceil().clamp(1, feat_w).long()
-            y2 = boxes[:, 3].ceil().clamp(1, feat_h).long()
-            for left, top, right, bottom in zip(x1, y1, x2, y2):
-                if right > left and bottom > top:
-                    masks[batch_idx, 0, top:bottom, left:right] = 1.0
+            scaled_boxes.append((batch_idx, boxes))
+        return scaled_boxes
+
+    def _build_bbox_pseudo_masks(self, batch_data_samples: SampleList,
+                                 feat_shape: Tuple[int, int],
+                                 input_shape: Tuple[int, int],
+                                 batch_size: int,
+                                 device: torch.device,
+                                 dtype: torch.dtype) -> Tensor:
+        """Rasterize GT boxes into soft feature-level foreground masks."""
+        feat_h, feat_w = feat_shape
+        masks = torch.zeros(
+            (batch_size, 1, feat_h, feat_w),
+            device=device,
+            dtype=dtype)
+        for batch_idx, boxes in self._collect_scaled_boxes(
+                batch_data_samples, input_shape, feat_shape, batch_size,
+                device, dtype):
+            for box in boxes:
+                self._paint_soft_box(masks[batch_idx, 0], box)
         return masks
+
+    def _build_bbox_quality_maps(self, batch_data_samples: SampleList,
+                                 feat_shape: Tuple[int, int],
+                                 input_shape: Tuple[int, int],
+                                 batch_size: int,
+                                 device: torch.device,
+                                 dtype: torch.dtype) -> Tensor:
+        """Rasterize GT boxes into Gaussian center quality maps."""
+        feat_h, feat_w = feat_shape
+        quality_maps = torch.zeros(
+            (batch_size, 1, feat_h, feat_w),
+            device=device,
+            dtype=dtype)
+        for batch_idx, boxes in self._collect_scaled_boxes(
+                batch_data_samples, input_shape, feat_shape, batch_size,
+                device, dtype):
+            for box in boxes:
+                self._paint_gaussian_box(quality_maps[batch_idx, 0], box)
+        return quality_maps
+
+    @staticmethod
+    def _paint_soft_box(mask: Tensor, box: Tensor) -> None:
+        feat_h, feat_w = mask.shape
+        x1, y1, x2, y2 = [float(v.item()) for v in box]
+        left = max(min(int(torch.floor(box[0]).item()), feat_w - 1), 0)
+        top = max(min(int(torch.floor(box[1]).item()), feat_h - 1), 0)
+        right = max(min(int(torch.ceil(box[2]).item()), feat_w), 1)
+        bottom = max(min(int(torch.ceil(box[3]).item()), feat_h), 1)
+        if right <= left or bottom <= top:
+            return
+        xs = torch.arange(left, right, device=mask.device, dtype=mask.dtype) + 0.5
+        ys = torch.arange(top, bottom, device=mask.device, dtype=mask.dtype) + 0.5
+        yy, xx = torch.meshgrid(ys, xs)
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        half_w = max((x2 - x1) * 0.5, 1.0)
+        half_h = max((y2 - y1) * 0.5, 1.0)
+        dx = (xx - cx).abs() / half_w
+        dy = (yy - cy).abs() / half_h
+        edge_distance = torch.maximum(dx, dy).clamp(max=1.0)
+        soft = 1.0 - 0.5 * edge_distance
+        mask[top:bottom, left:right] = torch.maximum(
+            mask[top:bottom, left:right], soft)
+
+    @staticmethod
+    def _paint_gaussian_box(quality_map: Tensor, box: Tensor) -> None:
+        feat_h, feat_w = quality_map.shape
+        x1, y1, x2, y2 = [float(v.item()) for v in box]
+        left = max(min(int(torch.floor(box[0]).item()), feat_w - 1), 0)
+        top = max(min(int(torch.floor(box[1]).item()), feat_h - 1), 0)
+        right = max(min(int(torch.ceil(box[2]).item()), feat_w), 1)
+        bottom = max(min(int(torch.ceil(box[3]).item()), feat_h), 1)
+        if right <= left or bottom <= top:
+            return
+        xs = torch.arange(left, right, device=quality_map.device,
+                          dtype=quality_map.dtype) + 0.5
+        ys = torch.arange(top, bottom, device=quality_map.device,
+                          dtype=quality_map.dtype) + 0.5
+        yy, xx = torch.meshgrid(ys, xs)
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        sigma_x = max((x2 - x1) * 0.3, 1.0)
+        sigma_y = max((y2 - y1) * 0.3, 1.0)
+        gaussian = torch.exp(-(((xx - cx)**2) / (2 * sigma_x**2) +
+                               ((yy - cy)**2) / (2 * sigma_y**2)))
+        quality_map[top:bottom, left:right] = torch.maximum(
+            quality_map[top:bottom, left:right], gaussian)
 
     @staticmethod
     def _dice_loss(pred_mask: Tensor, target_mask: Tensor) -> Tensor:
@@ -219,6 +319,7 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
         """Extract features."""  # 文档字符串：提取图像和文本特�?
         #
         # txt_masks = None#修改部分
+        txt_masks = None
         txt_feats = None  # 初始化文本特征为 None
         if batch_data_samples is None:  # 如果没有传入样本信息
             texts = self.texts  # 使用缓存的文本列�?

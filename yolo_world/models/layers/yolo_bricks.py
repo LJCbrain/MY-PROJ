@@ -1,5 +1,5 @@
 # Copyright (c) Tencent Inc. All rights reserved.
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -640,69 +640,125 @@ class EfficientCSPLayerWithTwoConv(CSPLayerWithTwoConv):
         return self.final_conv(torch.cat(x_main, 1))
 
 
-@MODELS.register_module()  # 新增代码：注册类别无关前景门控模块
-class ClassAgnosticForegroundGate(BaseModule):  # 新增代码：neck 内使用的前景感知特征门控
-    """Class-agnostic foreground gate for multi-level neck features."""  # 新增代码：说明该模块不做分类
+@MODELS.register_module()
+class ClassAgnosticForegroundGate(BaseModule):
+    """Class-agnostic quality recalibration for multi-level features.
 
-    def __init__(self,  # 新增代码：初始化多尺度 mask 分支
-                 in_channels: List[int],  # 新增代码：每个输出尺度的通道数
-                 hidden_ratio: float = 0.25,  # 新增代码：mask 分支隐藏通道比例
-                 min_hidden: int = 16,  # 新增代码：mask 分支最小隐藏通道数
-                 init_gamma: float = 0.0,  # 新增代码：残差门控初始强度
-                 max_gamma: float = 0.1,
+    The historical class name is retained for checkpoint and configuration
+    compatibility. The foreground mask, quality map, and dynamic gamma form
+    a visual reliability map that softly recalibrates each feature level.
+    """
+
+    def __init__(self,
+                 in_channels: List[int],
+                 hidden_ratio: float = 0.25,
+                 min_hidden: int = 16,
+                 init_gamma: float = 0.0,
+                 max_gamma: float = 0.15,
+                 gamma_init_bias: float = -0.3,
+                 gamma_hidden_ratio: float = 0.25,
+                 gamma_warmup_iters: int = 0,
                  return_parts: bool = True,
-                 norm_cfg: ConfigType = dict(type='BN',  # 新增代码：BN 类型
-                                             momentum=0.03,  # 新增代码：BN momentum
-                                             eps=0.001),  # 新增代码：沿用项目 BN 配置
-                 act_cfg: ConfigType = dict(type='SiLU',  # 新增代码：SiLU 激活
-                                            inplace=True),  # 新增代码：沿用项目激活配置
-                 init_cfg: OptMultiConfig = None) -> None:  # 新增代码：兼容 BaseModule 初始化
-        super().__init__(init_cfg=init_cfg)  # 新增代码：初始化 BaseModule
+                 norm_cfg: ConfigType = dict(type='BN',
+                                             momentum=0.03,
+                                             eps=0.001),
+                 act_cfg: ConfigType = dict(type='SiLU', inplace=True),
+                 init_cfg: OptMultiConfig = None) -> None:
+        super().__init__(init_cfg=init_cfg)
         self.max_gamma = max_gamma
+        self.gamma_warmup_iters = int(gamma_warmup_iters)
         self.return_parts = return_parts
-        self.mask_convs = nn.ModuleList()  # 新增代码：保存各尺度 mask 预测分支
-        self.gammas = nn.ParameterList()  # 新增代码：保存各尺度可学习残差门控强度
+        self.mask_convs = nn.ModuleList()
+        self.quality_convs = nn.ModuleList()
+        self.gamma_mlps = nn.ModuleList()
+        self.register_buffer(
+            '_gamma_step', torch.zeros((), dtype=torch.long), persistent=False)
 
-        for c in in_channels:  # 新增代码：为每个尺度构建独立类别无关 mask 分支
-            hidden = max(min_hidden, int(c * hidden_ratio))  # 新增代码：计算隐藏层通道数
-            self.mask_convs.append(  # 新增代码：添加当前尺度的 mask 分支
-                nn.Sequential(  # 新增代码：局部 objectness 预测结构
-                    ConvModule(c,  # 新增代码：输入通道数
-                               hidden,  # 新增代码：隐藏通道数
-                               3,  # 新增代码：3x3 卷积核
-                               padding=1,  # 新增代码：保持空间尺寸
-                               norm_cfg=norm_cfg,  # 新增代码：归一化配置
-                               act_cfg=act_cfg),  # 新增代码：3x3 局部特征提取
-                    nn.Conv2d(hidden, 1, 1)))  # 新增代码：输出 [B,1,H,W] 类别无关 logit
-            self.gammas.append(  # 新增代码：添加当前尺度的可学习残差强度
-                nn.Parameter(torch.tensor(float(init_gamma))))  # 新增代码：初始化 gamma
+        for c in in_channels:
+            hidden = max(min_hidden, int(c * hidden_ratio))
+            gamma_hidden = max(min_hidden, int(c * gamma_hidden_ratio))
+            self.mask_convs.append(
+                nn.Sequential(
+                    ConvModule(c,
+                               hidden,
+                               3,
+                               padding=1,
+                               norm_cfg=norm_cfg,
+                               act_cfg=act_cfg),
+                    nn.Conv2d(hidden, 1, 1)))
+            self.quality_convs.append(
+                nn.Sequential(
+                    ConvModule(2 * c + 1,
+                               hidden,
+                               3,
+                               padding=1,
+                               norm_cfg=norm_cfg,
+                               act_cfg=act_cfg),
+                    nn.Conv2d(hidden, 1, 1)))
+            gamma_mlp = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(c, gamma_hidden),
+                nn.SiLU(inplace=True),
+                nn.Linear(gamma_hidden, 1))
+            nn.init.constant_(gamma_mlp[-1].weight, 0.0)
+            if gamma_init_bias is None:
+                gamma_ratio = min(max(init_gamma / max(max_gamma, 1e-6),
+                                      1e-6), 1 - 1e-6)
+                gamma_init_bias = torch.logit(
+                    torch.tensor(gamma_ratio)).item()
+            nn.init.constant_(gamma_mlp[-1].bias, float(gamma_init_bias))
+            self.gamma_mlps.append(gamma_mlp)
 
-    def forward(self,  # 新增代码：执行类别无关前景门控
-                feats,  # 新增代码：输入 tuple/list 多尺度特征
-                txt_feats=None,  # 新增代码：保留文本接口，第一阶段不使用
-                txt_masks=None,  # 新增代码：保留文本 mask 接口，第一阶段不使用
-                return_parts: bool = None):  # 新增代码：是否返回 mask/fg/bg 调试信息
-        """Forward multi-level features without producing class logits."""  # 新增代码：强调不做分类
-        assert len(feats) == len(self.mask_convs)  # 新增代码：确保尺度数量匹配
+    def _gamma_warmup_scale(self) -> float:
+        if self.gamma_warmup_iters <= 0:
+            return 1.0
+        if self.training:
+            self._gamma_step.add_(1)
+        return min(
+            float(self._gamma_step.item()) / float(self.gamma_warmup_iters),
+            1.0)
+
+    def forward(self,
+                feats,
+                txt_feats=None,
+                txt_masks=None,
+                return_parts: bool = None):
+        """Forward multi-level features without producing class logits."""
+        assert len(feats) == len(self.mask_convs)
         if return_parts is None:
             return_parts = self.return_parts
-        out_feats = []  # 新增代码：保存门控后的特征
-        masks = []  # 新增代码：保存类别无关前景 mask
+        out_feats = []
+        masks = []
+        qualities = []
+        recalib_maps = []
         gammas = []
+        gamma_scale = self._gamma_warmup_scale()
 
-        for feat, mask_conv, gamma in zip(feats, self.mask_convs, self.gammas):  # 新增代码：逐尺度处理
-            logit = mask_conv(feat)  # 新增代码：预测 [B,1,H,W] 类别无关前景 logit
-            mask = torch.sigmoid(logit)  # 新增代码：得到类别无关前景 mask
-            gamma = torch.clamp(gamma, 0.0, self.max_gamma)
-            out = feat * (1.0 + gamma * mask)  # 温和前景重标定，不硬抑制背景
+        for feat, mask_conv, quality_conv, gamma_mlp in zip(
+                feats, self.mask_convs, self.quality_convs,
+                self.gamma_mlps):
+            mask = torch.sigmoid(mask_conv(feat))
+            masked_feat = feat * mask
+            quality_input = torch.cat((feat, masked_feat, mask), dim=1)
+            quality = torch.sigmoid(quality_conv(quality_input))
+            recalib = mask * quality
+            gamma = self.max_gamma * torch.sigmoid(gamma_mlp(feat))
+            gamma = gamma.view(-1, 1, 1, 1) * gamma_scale
+            out = feat * (1.0 + gamma * recalib)
 
-            out_feats.append(out)  # 新增代码：收集当前尺度输出
-            masks.append(mask)  # 新增代码：收集当前尺度 mask
+            out_feats.append(out)
+            masks.append(mask)
+            qualities.append(quality)
+            recalib_maps.append(recalib)
             gammas.append(gamma)
 
-        out_feats = tuple(out_feats)  # 新增代码：保持 neck 输出为 tuple[Tensor]
-        if return_parts:  # 新增代码：可选返回调试信息，不传给 head
-            return out_feats, dict(masks=masks,  # 新增代码：返回 mask 列表
-                                   gammas=gammas)  # 返回各尺度有效 gamma
-        return out_feats  # 新增代码：默认只返回 tuple[Tensor]
+        out_feats = tuple(out_feats)
+        if return_parts:
+            return out_feats, dict(masks=masks,
+                                   qualities=qualities,
+                                   recalib_maps=recalib_maps,
+                                   reliability_maps=recalib_maps,
+                                   gammas=gammas)
+        return out_feats
 

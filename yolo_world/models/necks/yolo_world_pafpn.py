@@ -47,9 +47,9 @@ class YOLOWorldPAFPN(YOLOv8PAFPN):
                          norm_cfg=norm_cfg,
                          act_cfg=act_cfg,
                          init_cfg=init_cfg)
-        self.fgbg_gate = (  # 新增代码：构建 neck 内部前景门控模块
-            MODELS.build(fgbg_cfg) if fgbg_cfg is not None else None)  # 新增代码：无配置时保持原 neck 行为
-        self._fgbg_parts = None  # 新增代码：缓存 mask/fg/bg，供后续调试或辅助 loss 使用
+        self.fgbg_gate = (
+            MODELS.build(fgbg_cfg) if fgbg_cfg is not None else None)
+        self._fgbg_parts = None
 
     def build_top_down_layer(self, idx: int) -> nn.Module:
         """build top down layer.
@@ -107,7 +107,9 @@ class YOLOWorldPAFPN(YOLOv8PAFPN):
                  act_cfg=self.act_cfg))
         return MODELS.build(block_cfg)
 
-    def forward(self, img_feats: List[Tensor], txt_feats: Tensor = None) -> tuple:
+    def forward(self,
+                img_feats: List[Tensor],
+                txt_feats: Tensor = None) -> tuple:
         """Forward function.
         including multi-level image features, text features: BxLxD
         """
@@ -147,15 +149,15 @@ class YOLOWorldPAFPN(YOLOv8PAFPN):
         for idx in range(len(self.in_channels)):
             results.append(self.out_layers[idx](outs[idx]))
 
-        results = tuple(results)  # 新增代码：保持 neck 输出为 tuple[Tensor]
-        if self.fgbg_gate is not None:  # 新增代码：可选执行类别无关前景门控
-            results, self._fgbg_parts = self.fgbg_gate(  # 新增代码：缓存 parts，但只返回特征给 head
-                results,  # 新增代码：传入 tuple[Tensor] 多尺度特征
-                txt_feats=txt_feats,  # 新增代码：保留文本接口，第一阶段模块内部不使用
-                txt_masks=None,  # 新增代码：第一阶段不使用文本 mask
-                return_parts=True)  # 新增代码：返回调试 parts 但不传给 head
+        results = tuple(results)
+        self._fgbg_parts = None
+        if self.fgbg_gate is not None:
+            results, self._fgbg_parts = self.fgbg_gate(
+                results,
+                txt_feats=txt_feats,
+                return_parts=True)
 
-        return results  # 新增代码：最终仍只返回 tuple[Tensor]
+        return results
 
 
 @MODELS.register_module()
