@@ -161,6 +161,42 @@ class YOLOWorldPAFPN(YOLOv8PAFPN):
 
 
 @MODELS.register_module()
+class YOLOWorldWSRPAFPN(YOLOWorldPAFPN):
+    """YOLO-World PAFPN with CAQR-guided weak support retrieval.
+
+    CAQR is applied in ``YOLOWorldPAFPN.forward``. This subclass keeps the
+    cached CAQR parts for auxiliary losses, then uses the P3 reliability map to
+    refine P3 with same-image visual support. P4/P5 and the detection head stay
+    unchanged.
+    """
+
+    def __init__(self,
+                 *args,
+                 wsr_cfg: ConfigType = None,
+                 **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.wsr = MODELS.build(wsr_cfg) if wsr_cfg is not None else None
+
+    def forward(self,
+                img_feats: List[Tensor],
+                txt_feats: Tensor = None) -> tuple:
+        results = super().forward(img_feats, txt_feats)
+        if self.wsr is None:
+            return results
+        if len(results) < 3:
+            return results
+        if not self._fgbg_parts or 'reliability_maps' not in self._fgbg_parts:
+            return results
+        reliability_maps = self._fgbg_parts['reliability_maps']
+        if not reliability_maps:
+            return results
+
+        p3 = self.wsr(results[0], results[1], results[2],
+                      reliability_maps[0].detach())
+        return (p3, *results[1:])
+
+
+@MODELS.register_module()
 class YOLOWorldDualPAFPN(YOLOWorldPAFPN):
     """Path Aggregation Network used in YOLO World v8."""
     def __init__(self,

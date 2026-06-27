@@ -1,4 +1,5 @@
 # Copyright (c) Tencent Inc. All rights reserved.
+import math
 from typing import List, Tuple
 
 import torch
@@ -761,4 +762,228 @@ class ClassAgnosticForegroundGate(BaseModule):
                                    reliability_maps=recalib_maps,
                                    gammas=gammas)
         return out_feats
+
+
+@MODELS.register_module()
+class WeakSupportRetriever(BaseModule):
+    """CAQR-guided same-image support retrieval for weak P3 features.
+
+    This module keeps the open-vocabulary head unchanged. It uses the
+    class-agnostic reliability map produced by CAQR to build a compact
+    same-image memory, retrieves visual support for every P3 location, and
+    applies a zero-initialized residual refinement to P3 only.
+    """
+
+    def __init__(self,
+                 in_channels: List[int],
+                 embed_channels: int = 64,
+                 num_reliable_tokens: int = 128,
+                 num_detail_tokens: int = 64,
+                 grid_size: int = 8,
+                 reliability_nms_kernel: int = 7,
+                 detail_kernel: int = 5,
+                 exclusion_radius: int = 1,
+                 reliability_log_weight: float = 0.5,
+                 support_dropout: float = 0.2,
+                 residual_scale: float = 0.1,
+                 detach_reliability: bool = True,
+                 enhance_level: int = 0,
+                 init_cfg: OptMultiConfig = None) -> None:
+        super().__init__(init_cfg=init_cfg)
+        assert len(in_channels) == 3, 'WSR expects P3/P4/P5 features.'
+        assert enhance_level == 0, 'WSR v1 only refines P3.'
+        self.embed_channels = embed_channels
+        self.num_reliable_tokens = int(num_reliable_tokens)
+        self.num_detail_tokens = int(num_detail_tokens)
+        self.grid_size = int(grid_size)
+        self.num_grid_tokens = self.grid_size * self.grid_size
+        self.num_support_tokens = (
+            self.num_reliable_tokens + self.num_detail_tokens +
+            self.num_grid_tokens)
+        self.reliability_nms_kernel = int(reliability_nms_kernel)
+        self.detail_kernel = int(detail_kernel)
+        self.exclusion_radius = int(exclusion_radius)
+        self.reliability_log_weight = float(reliability_log_weight)
+        self.support_dropout = float(support_dropout)
+        self.residual_scale = float(residual_scale)
+        self.detach_reliability = detach_reliability
+
+        c3, c4, c5 = in_channels
+        self.q_convs = nn.ModuleList([
+            nn.Conv2d(c3, embed_channels, 1),
+            nn.Conv2d(c4, embed_channels, 1),
+            nn.Conv2d(c5, embed_channels, 1),
+        ])
+        self.k_convs = nn.ModuleList([
+            nn.Conv2d(c3, embed_channels, 1),
+            nn.Conv2d(c4, embed_channels, 1),
+            nn.Conv2d(c5, embed_channels, 1),
+        ])
+        self.v_conv = nn.Conv2d(c3, embed_channels, 1)
+        self.q_norm = nn.LayerNorm(embed_channels)
+        self.k_norm = nn.LayerNorm(embed_channels)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(embed_channels * 2 + 2, embed_channels),
+            nn.SiLU(inplace=True),
+            nn.Linear(embed_channels, 1),
+        )
+        self.out_proj = nn.Linear(embed_channels, c3)
+        nn.init.constant_(self.out_proj.weight, 0.0)
+        nn.init.constant_(self.out_proj.bias, 0.0)
+
+    def _project_multiscale(self, feats: Tuple[Tensor, Tensor, Tensor],
+                            convs: nn.ModuleList) -> Tensor:
+        p3, p4, p5 = feats
+        size = p3.shape[-2:]
+        out = convs[0](p3)
+        out = out + F.interpolate(
+            convs[1](p4), size=size, mode='bilinear', align_corners=False)
+        out = out + F.interpolate(
+            convs[2](p5), size=size, mode='bilinear', align_corners=False)
+        return out
+
+    def _local_max_topk(self, scores: Tensor, k: int,
+                        nms_kernel: int) -> Tensor:
+        b, _, h, w = scores.shape
+        if k <= 0:
+            return scores.new_zeros((b, 0), dtype=torch.long)
+        flat_size = h * w
+        topk = min(k, flat_size)
+        if nms_kernel > 1:
+            pooled = F.max_pool2d(
+                scores, nms_kernel, stride=1, padding=nms_kernel // 2)
+            keep = scores >= pooled
+            scores = scores.masked_fill(~keep, -torch.inf)
+        return scores.flatten(1).topk(topk, dim=1).indices
+
+    def _grid_indices(self, h: int, w: int, device: torch.device) -> Tensor:
+        y = ((torch.arange(self.grid_size, device=device, dtype=torch.float32) +
+              0.5) * h / self.grid_size).long().clamp_(0, h - 1)
+        x = ((torch.arange(self.grid_size, device=device, dtype=torch.float32) +
+              0.5) * w / self.grid_size).long().clamp_(0, w - 1)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        return (yy.reshape(-1) * w + xx.reshape(-1)).long()
+
+    def _select_support_indices(self, p3: Tensor,
+                                reliability: Tensor) -> Tensor:
+        b, _, h, w = p3.shape
+        target = self.num_support_tokens
+
+        reliable_idx = self._local_max_topk(
+            reliability, self.num_reliable_tokens,
+            self.reliability_nms_kernel)
+
+        detail = p3 - F.avg_pool2d(
+            p3,
+            kernel_size=self.detail_kernel,
+            stride=1,
+            padding=self.detail_kernel // 2)
+        detail_scores = detail.square().mean(dim=1, keepdim=True).sqrt()
+        detail_idx = self._local_max_topk(
+            detail_scores, self.num_detail_tokens, self.reliability_nms_kernel)
+
+        grid_idx = self._grid_indices(h, w, p3.device)
+        fallback_k = min(max(target, 1), h * w)
+        fallback_idx = reliability.flatten(1).topk(fallback_k, dim=1).indices
+
+        candidates = torch.cat([
+            reliable_idx,
+            detail_idx,
+            grid_idx.view(1, -1).expand(b, -1),
+            fallback_idx,
+        ],
+                               dim=1)
+        num_candidates = candidates.shape[1]
+        order = torch.arange(num_candidates, device=p3.device)
+        same = candidates.unsqueeze(2) == candidates.unsqueeze(1)
+        first_order = torch.where(same,
+                                  order.view(1, 1, num_candidates),
+                                  num_candidates).min(dim=2).values
+        keep = first_order == order.view(1, num_candidates)
+        ordered_keep = torch.where(keep, order.view(1, num_candidates),
+                                   num_candidates)
+        select_k = min(target, num_candidates)
+        select_pos = ordered_keep.topk(
+            select_k, dim=1, largest=False).indices
+        selected = torch.gather(candidates, 1, select_pos)
+        if select_k < target:
+            pad = selected[:, :1].expand(-1, target - select_k)
+            selected = torch.cat([selected, pad], dim=1)
+        return selected[:, :target]
+
+    def _gather_tokens(self, token_map: Tensor, indices: Tensor) -> Tensor:
+        b, c, h, w = token_map.shape
+        flat = token_map.flatten(2).transpose(1, 2)
+        gather_idx = indices.unsqueeze(-1).expand(-1, -1, c)
+        return torch.gather(flat, 1, gather_idx)
+
+    def forward(self, p3: Tensor, p4: Tensor, p5: Tensor,
+                reliability: Tensor) -> Tensor:
+        """Refine P3 with sparse same-image support tokens."""
+        if self.detach_reliability:
+            reliability = reliability.detach()
+        reliability = reliability.clamp(min=1e-6, max=1.0)
+
+        b, c, h, w = p3.shape
+        support_idx = self._select_support_indices(p3, reliability)
+        support_scores = torch.gather(
+            reliability.flatten(1), 1, support_idx).clamp(min=1e-6)
+
+        feats = (p3, p4, p5)
+        q_map = self._project_multiscale(feats, self.q_convs)
+        k_map = self._project_multiscale(feats, self.k_convs)
+        v_map = self.v_conv(p3)
+
+        q = q_map.flatten(2).transpose(1, 2)
+        k = k_map.flatten(2).transpose(1, 2)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        v = v_map.flatten(2).transpose(1, 2)
+
+        support_k = torch.gather(
+            k, 1,
+            support_idx.unsqueeze(-1).expand(-1, -1, self.embed_channels))
+        support_v = torch.gather(
+            v, 1,
+            support_idx.unsqueeze(-1).expand(-1, -1, self.embed_channels))
+
+        logits = torch.bmm(q, support_k.transpose(1, 2))
+        logits = logits * (self.embed_channels**-0.5)
+        logits = logits + (
+            self.reliability_log_weight *
+            support_scores.log().unsqueeze(1))
+
+        if self.exclusion_radius >= 0:
+            y = torch.arange(h, device=p3.device).repeat_interleave(w)
+            x = torch.arange(w, device=p3.device).repeat(h)
+            support_y = support_idx // w
+            support_x = support_idx % w
+            near = (
+                (y.view(1, -1, 1) - support_y.view(b, 1, -1)).abs() <=
+                self.exclusion_radius) & (
+                    (x.view(1, -1, 1) - support_x.view(b, 1, -1)).abs() <=
+                    self.exclusion_radius)
+            logits = logits.masked_fill(near, -1e4)
+
+        if self.training and self.support_dropout > 0:
+            keep = torch.rand(
+                b,
+                self.num_support_tokens,
+                device=p3.device) >= self.support_dropout
+            empty = ~keep.any(dim=1)
+            if empty.any():
+                keep[empty, 0] = True
+            logits = logits.masked_fill(~keep.unsqueeze(1), -1e4)
+
+        attn = logits.softmax(dim=-1)
+        retrieved = torch.bmm(attn, support_v)
+        peak = attn.max(dim=-1, keepdim=True).values
+        entropy = -(attn * (attn + 1e-6).log()).sum(dim=-1, keepdim=True)
+        entropy = entropy / math.log(float(self.num_support_tokens))
+        gate = torch.sigmoid(
+            self.gate_mlp(torch.cat([q, retrieved, peak, entropy], dim=-1)))
+
+        update = self.out_proj(retrieved) * gate
+        update = update.transpose(1, 2).reshape(b, c, h, w)
+        return p3 + self.residual_scale * update
 

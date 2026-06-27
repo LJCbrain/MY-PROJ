@@ -24,6 +24,9 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
                  loss_fgbg_mask_dice_weight: Optional[float] = None,
                  loss_fgbg_quality_weight: float = 0.0,
                  loss_fgbg_consistency_weight: float = 0.0,
+                 loss_fgbg_consistency_mode: str = 'l1',
+                 loss_fgbg_consistency_fg_weight: float = 0.0,
+                 loss_fgbg_consistency_beta: float = 0.1,
                  **kwargs) -> None:  # 关键字参数，透传给父�?/-> None 表示这个函数不会返回任何有意义的�?
         self.mm_neck = mm_neck  # 保存是否使用多模�?neck 的配�?
         self.num_train_classes = num_train_classes  # 保存训练类别�?
@@ -36,6 +39,9 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             loss_fgbg_mask_dice_weight)
         self.loss_fgbg_quality_weight = loss_fgbg_quality_weight
         self.loss_fgbg_consistency_weight = loss_fgbg_consistency_weight
+        self.loss_fgbg_consistency_mode = loss_fgbg_consistency_mode
+        self.loss_fgbg_consistency_fg_weight = loss_fgbg_consistency_fg_weight
+        self.loss_fgbg_consistency_beta = loss_fgbg_consistency_beta
         super().__init__(*args, **kwargs)  # 调用父类构造函数完成基础初始�?
 
     def loss(self, batch_inputs: Tensor,  # 定义 loss 计算函数，batch_inputs 为图像张�?
@@ -108,13 +114,28 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
         if (self.loss_fgbg_consistency_weight > 0 and
                 len(pred_recalib_maps) > 1):
             consistency = 0.0
-            for src, dst in zip(pred_recalib_maps[:-1], pred_recalib_maps[1:]):
+            for idx, (src, dst) in enumerate(
+                    zip(pred_recalib_maps[:-1], pred_recalib_maps[1:])):
                 src = F.interpolate(
                     src,
                     size=dst.shape[-2:],
                     mode='bilinear',
                     align_corners=False)
-                consistency = consistency + F.l1_loss(src, dst.detach())
+                target = dst.detach()
+                if self.loss_fgbg_consistency_mode == 'owc':
+                    weight = 1.0 + (
+                        self.loss_fgbg_consistency_fg_weight *
+                        target_masks[idx + 1])
+                    raw_loss = F.smooth_l1_loss(
+                        src,
+                        target,
+                        beta=self.loss_fgbg_consistency_beta,
+                        reduction='none')
+                    pair_loss = (
+                        raw_loss * weight).sum() / weight.sum().clamp_min(1.0)
+                else:
+                    pair_loss = F.l1_loss(src, target)
+                consistency = consistency + pair_loss
             losses['loss_fgbg_consistency'] = (
                 consistency / (len(pred_recalib_maps) - 1) *
                 self.loss_fgbg_consistency_weight)

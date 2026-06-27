@@ -20,9 +20,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='MMYOLO test (and eval) a model')
     parser.add_argument('--config', help='test config file path',
-                        default=r"configs/pretrain/CKyolo_world_v2_l_clip_large_vlpan_bn_2e-3_100e_4x8gpus_obj365v1_goldg_train_800ft_lvis_minival.py")
+                        default=r"configs/pretrain/DIORv2.py")
     parser.add_argument('--checkpoint', help='checkpoint file',
-                        default=r'work_dirs/CKyolo_world_v2_l_clip_large_vlpan_bn_2e-3_100e_4x8gpus_obj365v1_goldg_train_800ft_lvis_minival/DIOR_DOTA_L_30_best.pth')
+                        default=r'work_dirs/dior/20260612_153214/best_coco_bbox_mAP_epoch_30.pth')
     parser.add_argument(
         '--work-dir',
         help='the directory to save the file containing evaluation metrics')

@@ -10,6 +10,7 @@ from .yolo_bricks import (
     RepConvMaxSigmoidCSPLayerWithTwoConv,
     RepMaxSigmoidCSPLayerWithTwoConv,
     ClassAgnosticForegroundGate,
+    WeakSupportRetriever,
 )
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     'RepMaxSigmoidCSPLayerWithTwoConv',
     'ImagePoolingAttentionModule',
     'ClassAgnosticForegroundGate',
+    'WeakSupportRetriever',
 ]
