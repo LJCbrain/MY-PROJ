@@ -78,7 +78,6 @@ model = dict(
     loss_fgbg_mask_dice_weight=0.03,
     loss_fgbg_quality_weight=0.01,
     loss_fgbg_consistency_weight=0.003,
-    loss_fgbg_consistency_mode='l1',
     data_preprocessor=dict(type='YOLOWDetDataPreprocessor'),
     backbone=dict(
         _delete_=True,
