@@ -67,6 +67,7 @@ weight_decay = 0.0125
 train_batch_size_per_gpu = 4
 text_model_name = r'pretrained_models/clip-vit-large-patch14-336'
 img_scale = (800, 800)
+load_from = 'weights/yolo_world_v2_l_clip_large_o365v1_goldg_pretrain_800ft-9df82e55.pth'
 
 # model settings
 model = dict(
