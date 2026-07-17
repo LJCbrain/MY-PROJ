@@ -34,8 +34,8 @@ from mmyolo.utils import is_metainfo_lower  # 导入 is_metainfo_lower：校验 
 def parse_args():  # 定义命令行参数解析函数
     parser = argparse.ArgumentParser(description='Train a detector')  # 创建参数解析器：描述为“训练检测器”
     parser.add_argument('--config', help='train config file path',  # 添加 --config 参数：配置文件路径
-                        default=r'configs/pretrain/DIORv2.py')  # 默认配置路径：你本地的预训练配置
-    parser.add_argument('--work-dir', default='work_dirs/DIORv2',help='the dir to save logs and models')  # 添加 --work-dir 参数：日志与模型保存目录
+                        default=r'configs/pretrain/DIOR_baseline.py')  # 默认配置路径：你本地的预训练配置
+    parser.add_argument('--work-dir', default='work_dirs/DIOR_baseline',help='the dir to save logs and models')  # 添加 --work-dir 参数：日志与模型保存目录
     parser.add_argument(  # 开始定义 --amp 参数
         '--amp',  # 参数名：--amp
         action='store_true',  # 行为：出现则为 True

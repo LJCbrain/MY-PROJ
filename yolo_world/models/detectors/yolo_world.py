@@ -1,3 +1,4 @@
+# -*- coding: latin-1 -*-
 # Copyright (c) Tencent Inc. All rights reserved.  # 版权声明
 
 from typing import List, Optional, Tuple, Union  # �?typing 导入类型注解工具
@@ -48,7 +49,14 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
         losses = self.bbox_head.loss(img_feats, txt_feats, txt_masks,  # 调用检测头�?loss 函数计算损失
                                      batch_data_samples)  # 传入样本列表作为标签
         losses.update(self._loss_fgbg(batch_inputs, batch_data_samples))
+        losses.update(self._loss_text_prompt_bank())
         return losses  # 返回损失结果
+
+    def _loss_text_prompt_bank(self) -> dict:
+        """Return text-side prompt-bank auxiliary losses, if enabled."""
+        if not hasattr(self.backbone, 'get_text_model_losses'):
+            return {}
+        return self.backbone.get_text_model_losses()
 
     def _loss_fgbg(self, batch_inputs: Tensor,
                    batch_data_samples: SampleList) -> dict:
@@ -76,9 +84,14 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
 
         losses = {}
         if self.loss_fgbg_mask_bce_weight > 0:
-            bce_loss = sum(
-                F.binary_cross_entropy(mask, target)
-                for mask, target in zip(pred_masks, target_masks))
+            # ``pred_masks`` are probabilities (the gate already applies a
+            # sigmoid), so BCE-with-logits would change the objective. CUDA
+            # AMP disallows probability BCE; compute this small auxiliary loss
+            # in FP32 while keeping the rest of the model in mixed precision.
+            with torch.cuda.amp.autocast(enabled=False):
+                bce_loss = sum(
+                    F.binary_cross_entropy(mask.float(), target.float())
+                    for mask, target in zip(pred_masks, target_masks))
             losses['loss_fgbg_mask_bce'] = (
                 bce_loss / len(pred_masks) * self.loss_fgbg_mask_bce_weight)
 
@@ -299,6 +312,9 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
     def reparameterize(self, texts: List[List[str]]) -> None:  # 重新参数化函数，将文本编码为特征并缓�?
         # encode text embeddings into the detector  # 注释：将文本嵌入编码并缓存到检测器�?
         self.texts = texts  # 缓存文本字符串列�?
+        if getattr(self.backbone, 'has_text_prompt_bank', False):
+            self.text_feats = None
+            return
         self.text_feats, _ = self.backbone.forward_text(texts)  # 通过 backbone 的文本分支编码文本，得到文本特征并缓�?
 
     def _forward(  # 定义不带后处理的前向函数（用于导�?调试�?
@@ -336,13 +352,34 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             txt_feats = self.text_feats  # 使用缓存文本特征
         else:  # 以上情况都不满足
             raise TypeError('batch_data_samples should be dict or list.')  # 抛出类型错误，提示输入不合法
-        if txt_feats is not None:  # 如果已经有文本特征（缓存�?
-            # forward image only  # 注释：只需要前向图像分�?
-            img_feats = self.backbone.forward_image(batch_inputs)  # 使用 backbone 的图像分支前向，得到图像特征
-        else:  # 否则需要同时前向图像和文本
-            img_feats, (txt_feats,  # �?backbone 返回图像特征�?(文本特征, 文本 mask)
-                        txt_masks) = self.backbone(batch_inputs, texts)  # 将图像和文本一起送入 backbone
-        if self.with_neck:  # 如果模型配置�?neck
+        prompt_bank_active = (
+            txt_feats is None and
+            getattr(self.backbone, 'has_text_prompt_bank', False))
+        neck_applied = False
+        if prompt_bank_active:
+            if (not self.with_neck or not self.mm_neck or
+                    not getattr(self.neck, 'prompt_bank_compatible', False)):
+                raise RuntimeError(
+                    'Prompt-bank text selection requires a multimodal neck '
+                    'with prompt_bank_compatible=True.')
+            # MSPB needs neck features to construct prompted text features,
+            # while C2F needs text features to guide the neck. Break this
+            # dependency with frozen, unprompted CLIP embeddings; prompted
+            # embeddings are still generated below for the detection head.
+            guide_txt_feats, _ = self.backbone.forward_text(texts)
+            img_feats = self.backbone.forward_image(batch_inputs)
+            img_feats = self.neck(img_feats, guide_txt_feats)
+            prompt_features, reliability_maps = \
+                self.neck.get_prompt_bank_context()
+            txt_feats, txt_masks = self.backbone.forward_prompted_text(
+                texts, prompt_features, reliability_maps)
+            neck_applied = True
+        elif txt_feats is not None:
+            img_feats = self.backbone.forward_image(batch_inputs)
+        else:
+            img_feats, (txt_feats, txt_masks) = self.backbone(
+                batch_inputs, texts)
+        if self.with_neck and not neck_applied:  # 如果模型配置�?neck
             if self.mm_neck:  # 如果使用多模�?neck
                 img_feats = self.neck(img_feats, txt_feats)  # neck 同时接收图像和文本特�?
             else:  # 普�?neck

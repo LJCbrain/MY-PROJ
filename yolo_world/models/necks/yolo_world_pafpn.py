@@ -33,11 +33,13 @@ class YOLOWorldPAFPN(YOLOv8PAFPN):
                                              eps=0.001),
                  act_cfg: ConfigType = dict(type='SiLU', inplace=True),
                  fgbg_cfg: ConfigType = None,  # 新增代码：可选类别无关前景门控配置
+                 prompt_bank_compatible: bool = False,
                  init_cfg: OptMultiConfig = None) -> None:
         self.guide_channels = guide_channels
         self.embed_channels = embed_channels
         self.num_heads = num_heads
         self.block_cfg = block_cfg
+        self.prompt_bank_compatible = bool(prompt_bank_compatible)
         super().__init__(in_channels=in_channels,
                          out_channels=out_channels,
                          deepen_factor=deepen_factor,
@@ -176,10 +178,12 @@ class YOLOWorldWSRPAFPN(YOLOWorldPAFPN):
                  **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.wsr = MODELS.build(wsr_cfg) if wsr_cfg is not None else None
+        self._prompt_bank_context = None
 
     def forward(self,
                 img_feats: List[Tensor],
                 txt_feats: Tensor = None) -> tuple:
+        self._prompt_bank_context = None
         results = super().forward(img_feats, txt_feats)
         if self.wsr is None:
             return results
@@ -193,7 +197,16 @@ class YOLOWorldWSRPAFPN(YOLOWorldPAFPN):
 
         p3 = self.wsr(results[0], results[1], results[2],
                       reliability_maps[0].detach())
-        return (p3, *results[1:])
+        results = (p3, *results[1:])
+        self._prompt_bank_context = (results, tuple(reliability_maps))
+        return results
+
+    def get_prompt_bank_context(self):
+        if self._prompt_bank_context is None:
+            raise RuntimeError(
+                'Prompt-bank context is unavailable. Run the neck with '
+                'CAQR and WSR enabled before encoding prompted text.')
+        return self._prompt_bank_context
 
 
 @MODELS.register_module()

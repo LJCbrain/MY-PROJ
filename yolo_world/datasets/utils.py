@@ -48,6 +48,12 @@ def yolow_collate(data_batch: Sequence,
 
     if hasattr(data_batch[0]['data_samples'], 'texts'):
         batch_texts = [meta['data_samples'].texts for meta in data_batch]
+        text_lengths = {len(texts) for texts in batch_texts}
+        if len(text_lengths) != 1:
+            raise ValueError(
+                'All samples in a YOLO-World batch must have the same '
+                f'number of text prompts, but got lengths '
+                f'{sorted(text_lengths)}.')
         collated_results['data_samples']['texts'] = batch_texts
 
     if hasattr(data_batch[0]['data_samples'], 'is_detection'):

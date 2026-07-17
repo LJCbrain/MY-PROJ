@@ -87,13 +87,30 @@ model = dict(
         text_model=dict(
             type='HuggingCLIPLanguageBackbone',
             model_name=text_model_name,
-            frozen_modules=['all'])),
+            frozen_modules=['all'],
+            prompt_bank_cfg=dict(
+                image_channels=[256, 512, _base_.last_stage_out_channels],
+                num_prompts=10,
+                prompt_length=12,
+                num_scales=3,
+                key_dim=text_channels,
+                use_reliability=True,
+                loss_match_weight=0.7,
+                loss_orthogonal_weight=0.3,
+                semantic_anchor_texts=DIOR_FULL_CLASSES,
+                semantic_anchor_embed_path=(
+                    'data/DIOR/clip_vit_large_patch14_336_'
+                    'dior20_text_embeddings.pt'),
+                semantic_anchor_weight=0.05,
+                semantic_anchor_warmup_iters=1000))),
     neck=dict(
         type='YOLOWorldWSRPAFPN',
         guide_channels=text_channels,
         embed_channels=neck_embed_channels,
         num_heads=neck_num_heads,
-        block_cfg=dict(type='GuideAgnosticCSPLayerWithTwoConv'),
+        prompt_bank_compatible=True,
+        # 保留 CAQR、WSR 和 MSPB，并加入原始 C2F 图文注意力。
+        block_cfg=dict(type='MaxSigmoidCSPLayerWithTwoConv'),
         fgbg_cfg=dict(
             type='ClassAgnosticForegroundGate',
             in_channels=[256, 512, _base_.last_stage_out_channels],
@@ -197,8 +214,10 @@ train_dataloader = dict(
             type='YOLOv5CocoDataset',
             metainfo=dict(classes=DIOR_BASE_CLASSES),
             data_root=data_root,
-            ann_file='Annotations/train_base_16cls_yoloworld.json',
-            data_prefix=dict(img='images/train/'),
+            ann_file=(
+                'Annotations2/'
+                'train_base_16cls_image_disjoint_yoloworld.json'),
+            data_prefix=dict(img='JPEGImages/'),
             filter_cfg=dict(filter_empty_gt=False, min_size=32)),
         class_text_path=dior_base_class_text_path,
         pipeline=train_pipeline))
@@ -227,8 +246,8 @@ dior_val_dataset = dict(
         metainfo=dict(classes=DIOR_FULL_CLASSES),
         data_root=data_root,
         test_mode=True,
-        ann_file='Annotations/val_yoloworld.json',
-        data_prefix=dict(img='images/val/'),
+        ann_file='Annotations2/val.json',
+        data_prefix=dict(img='JPEGImages/'),
         batch_shapes_cfg=None),
     class_text_path=dior_full_class_text_path,
     pipeline=test_pipeline)
@@ -241,8 +260,8 @@ dior_test_dataset = dict(
         metainfo=dict(classes=DIOR_FULL_CLASSES),
         data_root=data_root,
         test_mode=True,
-        ann_file='Annotations/test_yoloworld.json',
-        data_prefix=dict(img='images/test/'),
+        ann_file='Annotations2/test.json',
+        data_prefix=dict(img='JPEGImages/'),
         batch_shapes_cfg=None),
     class_text_path=dior_full_class_text_path,
     pipeline=test_pipeline)
@@ -252,13 +271,13 @@ test_dataloader = dict(dataset=dior_test_dataset)
 
 val_evaluator = dict(
     type='DIORCocoMetric',
-    ann_file='data/DIOR/Annotations/val_yoloworld.json',
+    ann_file='data/DIOR/Annotations2/val.json',
     metric='bbox',
     base_classes=DIOR_BASE_CLASSES,
     novel_classes=DIOR_NOVEL_CLASSES)
 test_evaluator = dict(
     type='DIORCocoMetric',
-    ann_file='data/DIOR/Annotations/test_yoloworld.json',
+    ann_file='data/DIOR/Annotations2/test.json',
     metric='bbox',
     base_classes=DIOR_BASE_CLASSES,
     novel_classes=DIOR_NOVEL_CLASSES)
@@ -266,7 +285,10 @@ test_evaluator = dict(
 # training settings
 default_hooks = dict(
     param_scheduler=dict(max_epochs=max_epochs),
-    checkpoint=dict(interval=save_epoch_intervals, rule='greater'))
+    checkpoint=dict(
+        interval=save_epoch_intervals,
+        save_best='coco/bbox_mAP_50_HM',
+        rule='greater'))
 custom_hooks = [
     dict(
         type='EMAHook',
@@ -305,6 +327,12 @@ optim_wrapper = dict(
         bias_decay_mult=0.0,
         norm_decay_mult=0.0,
         custom_keys={
+            'backbone.text_model.prompt_bank.prompts': dict(
+                lr_mult=0.5, decay_mult=0.0),
+            'backbone.text_model.prompt_bank.keys': dict(
+                lr_mult=0.5, decay_mult=0.0),
+            'backbone.text_model.prompt_bank.image_projs': dict(lr_mult=0.5),
+            'backbone.text_model.prompt_bank': dict(lr_mult=0.5),
             'backbone.text_model': dict(lr_mult=0.01),
             'logit_scale': dict(weight_decay=0.0)
         }),

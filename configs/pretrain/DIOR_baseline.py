@@ -64,9 +64,10 @@ neck_embed_channels = [128, 256, _base_.last_stage_out_channels // 2]
 neck_num_heads = [4, 8, _base_.last_stage_out_channels // 2 // 32]
 base_lr = 2e-3
 weight_decay = 0.0125
-train_batch_size_per_gpu = 4
+train_batch_size_per_gpu = 6
 text_model_name = r'pretrained_models/clip-vit-large-patch14-336'
 img_scale = (800, 800)
+load_from = 'weights/yolo_world_v2_l_clip_large_o365v1_goldg_pretrain_800ft-9df82e55.pth'
 
 # model settings
 model = dict(
@@ -74,10 +75,6 @@ model = dict(
     mm_neck=True,
     num_train_classes=num_training_classes,
     num_test_classes=num_test_classes,
-    loss_fgbg_mask_bce_weight=0.03,
-    loss_fgbg_mask_dice_weight=0.03,
-    loss_fgbg_quality_weight=0.01,
-    loss_fgbg_consistency_weight=0.003,
     data_preprocessor=dict(type='YOLOWDetDataPreprocessor'),
     backbone=dict(
         _delete_=True,
@@ -88,21 +85,16 @@ model = dict(
             model_name=text_model_name,
             frozen_modules=['all'])),
     neck=dict(
-        type='YOLOWorldPAFPN',
+        type='YOLOWorldDualPAFPN',
         guide_channels=text_channels,
         embed_channels=neck_embed_channels,
         num_heads=neck_num_heads,
-        block_cfg=dict(type='GuideAgnosticCSPLayerWithTwoConv'),
-        fgbg_cfg=dict(
-            type='ClassAgnosticForegroundGate',
-            in_channels=[256, 512, _base_.last_stage_out_channels],
-            hidden_ratio=0.25,
-            min_hidden=16,
-            max_gamma=0.15,
-            gamma_init_bias=-0.3,
-            gamma_warmup_iters=1000,
-            return_parts=True,
-        )),
+        block_cfg=dict(type='MaxSigmoidCSPLayerWithTwoConv'),
+        text_enhancder=dict(
+            type='ImagePoolingAttentionModule',
+            embed_channels=256,
+            num_heads=8,
+            pool_size=3)),
     bbox_head=dict(
         type='YOLOWorldHead',
         head_module=dict(
@@ -180,8 +172,10 @@ train_dataloader = dict(
             type='YOLOv5CocoDataset',
             metainfo=dict(classes=DIOR_BASE_CLASSES),
             data_root=data_root,
-            ann_file='Annotations/train_base_16cls_yoloworld.json',
-            data_prefix=dict(img='images/train/'),
+            ann_file=(
+                'Annotations2/'
+                'train_base_16cls_image_disjoint_yoloworld.json'),
+            data_prefix=dict(img='JPEGImages/'),
             filter_cfg=dict(filter_empty_gt=False, min_size=32)),
         class_text_path=dior_base_class_text_path,
         pipeline=train_pipeline))
@@ -210,8 +204,8 @@ dior_val_dataset = dict(
         metainfo=dict(classes=DIOR_FULL_CLASSES),
         data_root=data_root,
         test_mode=True,
-        ann_file='Annotations/val_yoloworld.json',
-        data_prefix=dict(img='images/val/'),
+        ann_file='Annotations2/val.json',
+        data_prefix=dict(img='JPEGImages/'),
         batch_shapes_cfg=None),
     class_text_path=dior_full_class_text_path,
     pipeline=test_pipeline)
@@ -224,8 +218,8 @@ dior_test_dataset = dict(
         metainfo=dict(classes=DIOR_FULL_CLASSES),
         data_root=data_root,
         test_mode=True,
-        ann_file='Annotations/test_yoloworld.json',
-        data_prefix=dict(img='images/test/'),
+        ann_file='Annotations2/test.json',
+        data_prefix=dict(img='JPEGImages/'),
         batch_shapes_cfg=None),
     class_text_path=dior_full_class_text_path,
     pipeline=test_pipeline)
@@ -235,13 +229,13 @@ test_dataloader = dict(dataset=dior_test_dataset)
 
 val_evaluator = dict(
     type='DIORCocoMetric',
-    ann_file='data/DIOR/Annotations/val_yoloworld.json',
+    ann_file='data/DIOR/Annotations2/val.json',
     metric='bbox',
     base_classes=DIOR_BASE_CLASSES,
     novel_classes=DIOR_NOVEL_CLASSES)
 test_evaluator = dict(
     type='DIORCocoMetric',
-    ann_file='data/DIOR/Annotations/test_yoloworld.json',
+    ann_file='data/DIOR/Annotations2/test.json',
     metric='bbox',
     base_classes=DIOR_BASE_CLASSES,
     novel_classes=DIOR_NOVEL_CLASSES)
