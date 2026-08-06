@@ -23,7 +23,6 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
                  loss_fgbg_dice_weight: float = 0.0,
                  loss_fgbg_mask_bce_weight: Optional[float] = None,
                  loss_fgbg_mask_dice_weight: Optional[float] = None,
-                 loss_fgbg_quality_weight: float = 0.0,
                  loss_fgbg_consistency_weight: float = 0.0,
                  **kwargs) -> None:  # 关键字参数，透传给父�?/-> None 表示这个函数不会返回任何有意义的�?
         self.mm_neck = mm_neck  # 保存是否使用多模�?neck 的配�?
@@ -35,7 +34,6 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
         self.loss_fgbg_mask_dice_weight = (
             loss_fgbg_dice_weight if loss_fgbg_mask_dice_weight is None else
             loss_fgbg_mask_dice_weight)
-        self.loss_fgbg_quality_weight = loss_fgbg_quality_weight
         self.loss_fgbg_consistency_weight = loss_fgbg_consistency_weight
         super().__init__(*args, **kwargs)  # 调用父类构造函数完成基础初始�?
 
@@ -58,6 +56,41 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             return {}
         return self.backbone.get_text_model_losses()
 
+    @staticmethod
+    def _build_prompt_positive_mask(
+            batch_data_samples, batch_size: int, num_texts: int,
+            device: torch.device) -> Tensor:
+        """Mark text slots whose local class is present in each image."""
+        positive_mask = torch.zeros(
+            batch_size, num_texts, device=device, dtype=torch.bool)
+        if isinstance(batch_data_samples, dict):
+            bboxes_labels = batch_data_samples.get('bboxes_labels', None)
+            if bboxes_labels is None or bboxes_labels.numel() == 0:
+                return positive_mask
+            image_indices = bboxes_labels[:, 0].long()
+            class_indices = bboxes_labels[:, 1].long()
+            valid = (
+                (image_indices >= 0) & (image_indices < batch_size) &
+                (class_indices >= 0) & (class_indices < num_texts))
+            positive_mask[
+                image_indices[valid], class_indices[valid]] = True
+            return positive_mask
+
+        if isinstance(batch_data_samples, list):
+            for image_idx, data_sample in enumerate(batch_data_samples):
+                if image_idx >= batch_size:
+                    break
+                gt_instances = getattr(data_sample, 'gt_instances', None)
+                labels = (
+                    getattr(gt_instances, 'labels', None)
+                    if gt_instances is not None else None)
+                if labels is None or labels.numel() == 0:
+                    continue
+                labels = labels.to(device=device, dtype=torch.long)
+                labels = labels[(labels >= 0) & (labels < num_texts)]
+                positive_mask[image_idx, labels] = True
+        return positive_mask
+
     def _loss_fgbg(self, batch_inputs: Tensor,
                    batch_data_samples: SampleList) -> dict:
         """Compute class-agnostic objectness recalibration losses."""
@@ -70,7 +103,6 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
         pred_masks = fgbg_parts['masks']
         if len(pred_masks) == 0:
             return {}
-        pred_qualities = fgbg_parts.get('qualities', None)
         pred_recalib_maps = fgbg_parts.get('recalib_maps', pred_masks)
 
         input_shape = batch_inputs.shape[-2:]
@@ -101,22 +133,6 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
                 for mask, target in zip(pred_masks, target_masks))
             losses['loss_fgbg_mask_dice'] = (
                 dice_loss / len(pred_masks) * self.loss_fgbg_mask_dice_weight)
-
-        if (self.loss_fgbg_quality_weight > 0 and pred_qualities is not None
-                and len(pred_qualities) > 0):
-            quality_targets = [
-                self._build_bbox_quality_maps(batch_data_samples,
-                                              quality.shape[-2:], input_shape,
-                                              batch_size, quality.device,
-                                              quality.dtype)
-                for quality in pred_qualities
-            ]
-            quality_loss = sum(
-                F.smooth_l1_loss(quality, target)
-                for quality, target in zip(pred_qualities, quality_targets))
-            losses['loss_fgbg_quality'] = (
-                quality_loss / len(pred_qualities) *
-                self.loss_fgbg_quality_weight)
 
         if (self.loss_fgbg_consistency_weight > 0 and
                 len(pred_recalib_maps) > 1):
@@ -195,25 +211,6 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
                 self._paint_soft_box(masks[batch_idx, 0], box)
         return masks
 
-    def _build_bbox_quality_maps(self, batch_data_samples: SampleList,
-                                 feat_shape: Tuple[int, int],
-                                 input_shape: Tuple[int, int],
-                                 batch_size: int,
-                                 device: torch.device,
-                                 dtype: torch.dtype) -> Tensor:
-        """Rasterize GT boxes into Gaussian center quality maps."""
-        feat_h, feat_w = feat_shape
-        quality_maps = torch.zeros(
-            (batch_size, 1, feat_h, feat_w),
-            device=device,
-            dtype=dtype)
-        for batch_idx, boxes in self._collect_scaled_boxes(
-                batch_data_samples, input_shape, feat_shape, batch_size,
-                device, dtype):
-            for box in boxes:
-                self._paint_gaussian_box(quality_maps[batch_idx, 0], box)
-        return quality_maps
-
     @staticmethod
     def _paint_soft_box(mask: Tensor, box: Tensor) -> None:
         feat_h, feat_w = mask.shape
@@ -237,30 +234,6 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
         soft = 1.0 - 0.5 * edge_distance
         mask[top:bottom, left:right] = torch.maximum(
             mask[top:bottom, left:right], soft)
-
-    @staticmethod
-    def _paint_gaussian_box(quality_map: Tensor, box: Tensor) -> None:
-        feat_h, feat_w = quality_map.shape
-        x1, y1, x2, y2 = [float(v.item()) for v in box]
-        left = max(min(int(torch.floor(box[0]).item()), feat_w - 1), 0)
-        top = max(min(int(torch.floor(box[1]).item()), feat_h - 1), 0)
-        right = max(min(int(torch.ceil(box[2]).item()), feat_w), 1)
-        bottom = max(min(int(torch.ceil(box[3]).item()), feat_h), 1)
-        if right <= left or bottom <= top:
-            return
-        xs = torch.arange(left, right, device=quality_map.device,
-                          dtype=quality_map.dtype) + 0.5
-        ys = torch.arange(top, bottom, device=quality_map.device,
-                          dtype=quality_map.dtype) + 0.5
-        yy, xx = torch.meshgrid(ys, xs)
-        cx = (x1 + x2) * 0.5
-        cy = (y1 + y2) * 0.5
-        sigma_x = max((x2 - x1) * 0.3, 1.0)
-        sigma_y = max((y2 - y1) * 0.3, 1.0)
-        gaussian = torch.exp(-(((xx - cx)**2) / (2 * sigma_x**2) +
-                               ((yy - cy)**2) / (2 * sigma_y**2)))
-        quality_map[top:bottom, left:right] = torch.maximum(
-            quality_map[top:bottom, left:right], gaussian)
 
     @staticmethod
     def _dice_loss(pred_mask: Tensor, target_mask: Tensor) -> Tensor:
@@ -362,17 +335,29 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
                 raise RuntimeError(
                     'Prompt-bank text selection requires a multimodal neck '
                     'with prompt_bank_compatible=True.')
-            # MSPB needs neck features to construct prompted text features,
+            # GuardPrompt needs neck features to construct prompted text features,
             # while C2F needs text features to guide the neck. Break this
             # dependency with frozen, unprompted CLIP embeddings; prompted
             # embeddings are still generated below for the detection head.
-            guide_txt_feats, _ = self.backbone.forward_text(texts)
+            guide_txt_feats, guide_txt_masks = self.backbone.forward_text(texts)
             img_feats = self.backbone.forward_image(batch_inputs)
-            img_feats = self.neck(img_feats, guide_txt_feats)
+            img_feats = self.neck(
+                img_feats, guide_txt_feats, txt_masks=guide_txt_masks)
             prompt_features, reliability_maps = \
                 self.neck.get_prompt_bank_context()
+            positive_class_mask = None
+            if self.training:
+                positive_class_mask = self._build_prompt_positive_mask(
+                    batch_data_samples,
+                    batch_inputs.shape[0],
+                    guide_txt_feats.shape[1],
+                    guide_txt_feats.device)
             txt_feats, txt_masks = self.backbone.forward_prompted_text(
-                texts, prompt_features, reliability_maps)
+                texts,
+                prompt_features,
+                reliability_maps,
+                base_text_features=guide_txt_feats,
+                positive_class_mask=positive_class_mask)
             neck_applied = True
         elif txt_feats is not None:
             img_feats = self.backbone.forward_image(batch_inputs)

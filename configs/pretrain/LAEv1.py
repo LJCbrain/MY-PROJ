@@ -37,7 +37,7 @@ num_classes = 80
 num_training_classes = 80
 num_test_classes = 80
 
-max_epochs = 32
+max_epochs = 16
 close_mosaic_epochs = 2
 save_epoch_intervals = 2
 text_channels = 768
@@ -45,19 +45,23 @@ neck_embed_channels = OUT_CHANNELS_
 neck_num_heads = [4, 8, _base_.last_stage_out_channels // 2 // 32]
 base_lr = 2e-3
 weight_decay = 0.05 / 2
-train_batch_size_per_gpu =4
+train_batch_size_per_gpu = 8
 img_scale = (800, 800)
 text_model_name = r'pretrained_models/clip-vit-large-patch14-336'
 load_from = (
     'weights/yolo_world_v2_l_clip_large_o365v1_goldg_pretrain_800ft-'
     '9df82e55.pth')
 
+semantic_anchor_enabled = False
 semantic_anchor_path = (
-    'data/LAE-1M/semantic_anchors/lae_1m_anchor_96.json')
+    'data/LAE-1M/semantic_anchors/lae_1m_anchor_96.json'
+    if semantic_anchor_enabled else None)
 semantic_anchor_embed_path = (
-    'data/LAE-1M/semantic_anchors/lae_1m_anchor_96_clip_vit_large.pt')
-semantic_anchor_texts = _load_class_texts(semantic_anchor_path)
-if len(semantic_anchor_texts) != 96:
+    'data/LAE-1M/semantic_anchors/lae_1m_anchor_96_clip_vit_large.pt'
+    if semantic_anchor_enabled else None)
+semantic_anchor_texts = (
+    _load_class_texts(semantic_anchor_path) if semantic_anchor_enabled else ())
+if semantic_anchor_enabled and len(semantic_anchor_texts) != 96:
     raise ValueError(
         f'Expected exactly 96 LAE semantic anchors, got '
         f'{len(semantic_anchor_texts)} from {semantic_anchor_path}.')
@@ -70,7 +74,6 @@ model = dict(
     num_test_classes=num_test_classes,
     loss_fgbg_mask_bce_weight=0.03,
     loss_fgbg_mask_dice_weight=0.03,
-    loss_fgbg_quality_weight=0.01,
     loss_fgbg_consistency_weight=0.003,
     data_preprocessor=dict(type='YOLOWDetDataPreprocessor'),
     backbone=dict(
@@ -81,6 +84,8 @@ model = dict(
             type='HuggingCLIPLanguageBackbone',
             model_name=text_model_name,
             frozen_modules=['all'],
+            add_mask=True,
+            pad_value='',
             prompt_bank_cfg=dict(
                 image_channels=[256, 512, _base_.last_stage_out_channels],
                 num_prompts=10,
@@ -92,7 +97,8 @@ model = dict(
                 loss_orthogonal_weight=0.3,
                 semantic_anchor_texts=semantic_anchor_texts,
                 semantic_anchor_embed_path=semantic_anchor_embed_path,
-                semantic_anchor_weight=0.05,
+                semantic_anchor_weight=(0.05 if semantic_anchor_enabled else
+                                        0.0),
                 semantic_anchor_warmup_iters=1000))),
     neck=dict(
         type='YOLOWorldWSRPAFPN',
@@ -102,13 +108,19 @@ model = dict(
         prompt_bank_compatible=True,
         block_cfg=dict(type='MaxSigmoidCSPLayerWithTwoConv'),
         fgbg_cfg=dict(
-            type='ClassAgnosticForegroundGate',
+            type='RegionalBackgroundPriorGate',
             in_channels=[256, 512, _base_.last_stage_out_channels],
+            region_grid_size=3,
+            background_keep_ratio=0.75,
+            attention_heads=[4, 8, 8],
             hidden_ratio=0.25,
             min_hidden=16,
             max_gamma=0.15,
             gamma_init_bias=-0.3,
             gamma_warmup_iters=1000,
+            fusion_weights=(0.5, 0.25),
+            use_caqr=False,
+            direct_feature_boost=False,
             return_parts=True),
         wsr_cfg=dict(
             type='WeakSupportRetriever',
@@ -124,7 +136,7 @@ model = dict(
             support_dropout=0.2,
             residual_scale=0.1,
             detach_reliability=True,
-            enhance_level=0)),
+            enhance_level=0),),
     bbox_head=dict(
         type='YOLOWorldHead',
         head_module=dict(

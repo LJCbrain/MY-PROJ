@@ -765,13 +765,388 @@ class ClassAgnosticForegroundGate(BaseModule):
 
 
 @MODELS.register_module()
+class RegionalBackgroundPriorGate(BaseModule):
+    """Regional background prior for class-agnostic object routing.
+
+    Each feature level is split into a small regular grid.  A robust regional
+    background token is estimated from the most background-like locations and
+    refined by attention that is restricted to the same region.  The inverted
+    cosine similarity to that token is the base foreground prior.  CAQR fusion
+    and direct feature amplification remain optional for backward
+    compatibility; disabling both turns this module into a pure routing prior.
+    """
+
+    def __init__(self,
+                 in_channels: List[int],
+                 region_grid_size: int = 3,
+                 background_keep_ratio: float = 0.75,
+                 attention_heads: List[int] = (4, 8, 8),
+                 hidden_ratio: float = 0.25,
+                 min_hidden: int = 16,
+                 caqr_init_prob: float = 0.01,
+                 caqr_beta_max: float = 0.3,
+                 caqr_beta_warmup_iters: int = 1000,
+                 init_gamma: float = 0.0,
+                 max_gamma: float = 0.15,
+                 gamma_init_bias: float = -0.3,
+                 gamma_hidden_ratio: float = 0.25,
+                 gamma_warmup_iters: int = 1000,
+                 fusion_weights: Tuple[float, float] = (0.5, 0.25),
+                 use_caqr: bool = True,
+                 direct_feature_boost: bool = True,
+                 return_parts: bool = True,
+                 norm_cfg: ConfigType = dict(type='BN',
+                                             momentum=0.03,
+                                             eps=0.001),
+                 act_cfg: ConfigType = dict(type='SiLU', inplace=True),
+                 init_cfg: OptMultiConfig = None) -> None:
+        super().__init__(init_cfg=init_cfg)
+        if len(in_channels) != len(attention_heads):
+            raise ValueError('attention_heads must match in_channels.')
+        if not 0 < background_keep_ratio <= 1:
+            raise ValueError('background_keep_ratio must be in (0, 1].')
+        if not 0 <= caqr_beta_max <= 1:
+            raise ValueError('caqr_beta_max must be in [0, 1].')
+        if len(in_channels) != 3:
+            raise ValueError('Scheme A expects P3/P4/P5 feature levels.')
+
+        self.region_grid_size = int(region_grid_size)
+        self.background_keep_ratio = float(background_keep_ratio)
+        self.caqr_beta_max = float(caqr_beta_max)
+        self.caqr_beta_warmup_iters = int(caqr_beta_warmup_iters)
+        self.max_gamma = float(max_gamma)
+        self.gamma_warmup_iters = int(gamma_warmup_iters)
+        self.fusion_weights = tuple(float(v) for v in fusion_weights)
+        self.use_caqr = bool(use_caqr)
+        self.direct_feature_boost = bool(direct_feature_boost)
+        self.return_parts = bool(return_parts)
+
+        self.region_attentions = nn.ModuleList()
+        self.region_norms = nn.ModuleList()
+        self.caqr_mask_convs = nn.ModuleList()
+        self.gamma_mlps = nn.ModuleList()
+        # This state must survive checkpoints so resumed training and inference
+        # do not silently restart the residual warm-up.
+        self.register_buffer(
+            '_gamma_step', torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer(
+            '_caqr_beta_step', torch.zeros((), dtype=torch.long),
+            persistent=True)
+
+        caqr_bias = torch.logit(
+            torch.tensor(float(caqr_init_prob)).clamp(1e-6, 1 - 1e-6))
+        for channels, num_heads in zip(in_channels, attention_heads):
+            if channels % int(num_heads) != 0:
+                raise ValueError(
+                    f'{channels} channels are not divisible by {num_heads} heads.')
+            attention = nn.MultiheadAttention(
+                channels, int(num_heads), dropout=0.0, batch_first=True)
+            # Start from the robust regional mean. Attention is introduced
+            # gradually as its zero-initialized output projection learns.
+            nn.init.constant_(attention.out_proj.weight, 0.0)
+            nn.init.constant_(attention.out_proj.bias, 0.0)
+            self.region_attentions.append(attention)
+            self.region_norms.append(nn.LayerNorm(channels))
+
+            hidden = max(min_hidden, int(channels * hidden_ratio))
+            caqr_mask_conv = nn.Sequential(
+                ConvModule(channels,
+                           hidden,
+                           3,
+                           padding=1,
+                           norm_cfg=norm_cfg,
+                           act_cfg=act_cfg),
+                nn.Conv2d(hidden, 1, 1))
+            # With beta=0 at the start of training, this branch is initially
+            # inert. Its low prior prevents an abrupt background boost later.
+            nn.init.constant_(caqr_mask_conv[-1].weight, 0.0)
+            nn.init.constant_(caqr_mask_conv[-1].bias, float(caqr_bias))
+            if not self.use_caqr:
+                caqr_mask_conv.requires_grad_(False)
+            self.caqr_mask_convs.append(caqr_mask_conv)
+
+            gamma_hidden = max(min_hidden, int(channels * gamma_hidden_ratio))
+            gamma_mlp = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(channels, gamma_hidden),
+                nn.SiLU(inplace=True),
+                nn.Linear(gamma_hidden, 1))
+            nn.init.constant_(gamma_mlp[-1].weight, 0.0)
+            if gamma_init_bias is None:
+                ratio = min(max(init_gamma / max(max_gamma, 1e-6), 1e-6),
+                            1 - 1e-6)
+                gamma_init_bias = torch.logit(torch.tensor(ratio)).item()
+            nn.init.constant_(gamma_mlp[-1].bias, float(gamma_init_bias))
+            if not self.direct_feature_boost:
+                gamma_mlp.requires_grad_(False)
+            self.gamma_mlps.append(gamma_mlp)
+
+    def _gamma_warmup_scale(self) -> float:
+        if self.gamma_warmup_iters <= 0:
+            return 1.0
+        if self.training:
+            self._gamma_step.add_(1)
+        return min(
+            float(self._gamma_step.item()) / float(self.gamma_warmup_iters),
+            1.0)
+
+    def _caqr_beta(self) -> float:
+        """Return the CAQR contribution after a zero-to-beta warm-up."""
+        if self.caqr_beta_warmup_iters <= 0:
+            return self.caqr_beta_max
+        scale = min(
+            float(self._caqr_beta_step.item()) /
+            float(self.caqr_beta_warmup_iters), 1.0)
+        if self.training:
+            self._caqr_beta_step.add_(1)
+        return self.caqr_beta_max * scale
+
+    def _regional_foreground_prior(self, feat: Tensor,
+                                   attention: nn.MultiheadAttention,
+                                   token_norm: nn.LayerNorm) -> Tensor:
+        batch_size, channels, height, width = feat.shape
+        prior = feat.new_zeros((batch_size, 1, height, width))
+        y_edges = torch.linspace(
+            0, height, self.region_grid_size + 1,
+            device=feat.device).round().long()
+        x_edges = torch.linspace(
+            0, width, self.region_grid_size + 1,
+            device=feat.device).round().long()
+
+        for row in range(self.region_grid_size):
+            y1, y2 = int(y_edges[row]), int(y_edges[row + 1])
+            for col in range(self.region_grid_size):
+                x1, x2 = int(x_edges[col]), int(x_edges[col + 1])
+                region = feat[:, :, y1:y2, x1:x2]
+                tokens = region.flatten(2).transpose(1, 2)
+                if tokens.shape[1] == 0:
+                    continue
+
+                initial_token = tokens.mean(dim=1, keepdim=True)
+                similarities = F.cosine_similarity(
+                    tokens, initial_token, dim=-1)
+                keep_count = max(
+                    1,
+                    int(math.ceil(tokens.shape[1] *
+                                  self.background_keep_ratio)))
+                keep_indices = similarities.topk(
+                    keep_count, dim=1, largest=True).indices
+                gather_indices = keep_indices.unsqueeze(-1).expand(
+                    -1, -1, channels)
+                background_tokens = torch.gather(
+                    tokens, 1, gather_indices).mean(dim=1, keepdim=True)
+                key_padding_mask = torch.ones(
+                    (batch_size, tokens.shape[1]),
+                    dtype=torch.bool,
+                    device=feat.device)
+                key_padding_mask.scatter_(1, keep_indices, False)
+
+                refined, _ = attention(
+                    background_tokens,
+                    tokens,
+                    tokens,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False)
+                background_tokens = token_norm(background_tokens + refined)
+                cosine = F.cosine_similarity(
+                    tokens, background_tokens, dim=-1)
+                region_prior = (1.0 - cosine) * 0.5
+                region_prior = region_prior.to(feat.dtype).reshape(
+                    batch_size, 1, y2 - y1, x2 - x1)
+                prior[:, :, y1:y2, x1:x2] = region_prior
+        return prior.clamp_(0.0, 1.0)
+
+    def _fuse_reliability_maps(self, maps: List[Tensor]) -> Tensor:
+        target_size = maps[0].shape[-2:]
+        p4 = F.interpolate(
+            maps[1], target_size, mode='bilinear', align_corners=False)
+        p5 = F.interpolate(
+            maps[2], target_size, mode='bilinear', align_corners=False)
+        w4, w5 = self.fusion_weights
+        fused = 1.0 - ((1.0 - maps[0]) * (1.0 - w4 * p4) *
+                       (1.0 - w5 * p5))
+        return fused.clamp_(0.0, 1.0)
+
+    def forward(self,
+                feats,
+                txt_feats=None,
+                txt_masks=None,
+                return_parts: bool = None):
+        del txt_feats, txt_masks
+        if return_parts is None:
+            return_parts = self.return_parts
+        if len(feats) != len(self.region_attentions):
+            raise ValueError('Feature levels do not match configured channels.')
+
+        gamma_scale = (
+            self._gamma_warmup_scale() if self.direct_feature_boost else 0.0)
+        caqr_beta = self._caqr_beta() if self.use_caqr else 0.0
+        out_feats, masks = [], []
+        regional_priors, caqr_masks = [], []
+        recalib_maps, gammas = [], []
+        for feat, attention, token_norm, caqr_mask_conv, gamma_mlp in zip(
+                feats, self.region_attentions, self.region_norms,
+                self.caqr_mask_convs, self.gamma_mlps):
+            regional_prior = self._regional_foreground_prior(
+                feat, attention, token_norm)
+            if self.use_caqr:
+                caqr_mask = torch.sigmoid(caqr_mask_conv(feat))
+                # P_safe = 1 - (1 - P_region) * (1 - beta * C).
+                foreground_prior = 1.0 - (
+                    (1.0 - regional_prior) * (1.0 - caqr_beta * caqr_mask))
+                foreground_prior = foreground_prior.clamp_(0.0, 1.0)
+            else:
+                caqr_mask = torch.zeros_like(regional_prior)
+                foreground_prior = regional_prior
+            reliability = foreground_prior
+            if self.direct_feature_boost:
+                gamma = self.max_gamma * torch.sigmoid(gamma_mlp(feat))
+                gamma = gamma.view(-1, 1, 1, 1) * gamma_scale
+                out_feats.append(feat * (1.0 + gamma * reliability))
+            else:
+                gamma = feat.new_zeros((feat.shape[0], 1, 1, 1))
+                out_feats.append(feat)
+            masks.append(foreground_prior)
+            regional_priors.append(regional_prior)
+            caqr_masks.append(caqr_mask)
+            recalib_maps.append(reliability)
+            gammas.append(gamma)
+
+        out_feats = tuple(out_feats)
+        if not return_parts:
+            return out_feats
+        fused = self._fuse_reliability_maps(recalib_maps)
+        return out_feats, dict(
+            masks=masks,
+            regional_priors=regional_priors,
+            caqr_masks=caqr_masks,
+            caqr_beta=caqr_beta,
+            recalib_maps=recalib_maps,
+            reliability_maps=recalib_maps,
+            fused_reliability=fused,
+            gammas=gammas)
+
+
+@MODELS.register_module()
+class RegionalTextResidual(BaseModule):
+    """Inject a small text residual only at reliable P3 locations.
+
+    The original feature is always preserved.  A class-agnostic Regional
+    reliability map and a text-similarity gate jointly route the residual.
+    Reliability is detached by default so detection classification gradients
+    cannot turn the Regional branch into a base-class gate.
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 text_channels: int,
+                 embed_channels: int = 64,
+                 max_residual_scale: float = 0.1,
+                 warmup_iters: int = 1000,
+                 logit_scale: float = 10.0,
+                 detach_reliability: bool = True,
+                 init_cfg: OptMultiConfig = None) -> None:
+        super().__init__(init_cfg=init_cfg)
+        if embed_channels <= 0:
+            raise ValueError('embed_channels must be positive.')
+        if max_residual_scale < 0:
+            raise ValueError('max_residual_scale must be non-negative.')
+
+        self.max_residual_scale = float(max_residual_scale)
+        self.warmup_iters = int(warmup_iters)
+        self.logit_scale = float(logit_scale)
+        self.detach_reliability = bool(detach_reliability)
+
+        self.query_proj = nn.Conv2d(
+            in_channels, embed_channels, kernel_size=1, bias=False)
+        self.key_proj = nn.Linear(text_channels, embed_channels, bias=False)
+        self.value_proj = nn.Linear(
+            text_channels, embed_channels, bias=False)
+        self.out_proj = nn.Conv2d(
+            embed_channels, in_channels, kernel_size=1, bias=False)
+
+        nn.init.xavier_uniform_(self.query_proj.weight)
+        nn.init.xavier_uniform_(self.key_proj.weight)
+        nn.init.xavier_uniform_(self.value_proj.weight)
+        # Identity initialization protects the original YOLO-World path.
+        nn.init.constant_(self.out_proj.weight, 0.0)
+        self.register_buffer(
+            '_warmup_step', torch.zeros((), dtype=torch.long),
+            persistent=True)
+
+    def _residual_scale(self) -> float:
+        if self.warmup_iters <= 0:
+            return self.max_residual_scale
+        if self.training:
+            self._warmup_step.add_(1)
+        ratio = min(
+            float(self._warmup_step.item()) / float(self.warmup_iters), 1.0)
+        return self.max_residual_scale * ratio
+
+    def forward(self,
+                feat: Tensor,
+                txt_feats: Tensor,
+                reliability: Tensor,
+                txt_masks: Tensor = None) -> Tensor:
+        if txt_feats is None or reliability is None:
+            return feat
+        if txt_feats.dim() == 2:
+            txt_feats = txt_feats.unsqueeze(0)
+        if txt_feats.shape[0] == 1 and feat.shape[0] > 1:
+            txt_feats = txt_feats.expand(feat.shape[0], -1, -1)
+        if txt_feats.shape[0] != feat.shape[0]:
+            raise ValueError('Text and image batch sizes must match.')
+
+        batch_size, _, height, width = feat.shape
+        queries = self.query_proj(feat).flatten(2).transpose(1, 2)
+        keys = self.key_proj(txt_feats)
+        queries = F.normalize(queries, dim=-1)
+        keys = F.normalize(keys, dim=-1)
+        logits = torch.einsum('bnd,bcd->bnc', queries, keys)
+        logits = logits * self.logit_scale
+
+        valid_mask = None
+        if txt_masks is not None:
+            valid_mask = txt_masks.to(device=logits.device, dtype=torch.bool)
+            if valid_mask.dim() == 1:
+                valid_mask = valid_mask.unsqueeze(0)
+            if valid_mask.shape[0] == 1 and batch_size > 1:
+                valid_mask = valid_mask.expand(batch_size, -1)
+            if valid_mask.shape != logits.shape[:1] + logits.shape[2:]:
+                raise ValueError('Text mask shape does not match text features.')
+            logits = logits.masked_fill(
+                ~valid_mask[:, None, :], torch.finfo(logits.dtype).min)
+
+        attention = logits.softmax(dim=-1)
+        values = self.value_proj(txt_feats)
+        context = torch.einsum('bnc,bcd->bnd', attention, values)
+        context = context.transpose(1, 2).reshape(
+            batch_size, -1, height, width)
+        delta = self.out_proj(context)
+
+        text_gate = torch.sigmoid(logits.max(dim=-1).values)
+        text_gate = text_gate.reshape(batch_size, 1, height, width)
+        if reliability.shape[-2:] != (height, width):
+            reliability = F.interpolate(
+                reliability,
+                size=(height, width),
+                mode='bilinear',
+                align_corners=False)
+        if self.detach_reliability:
+            reliability = reliability.detach()
+        route = reliability.to(dtype=feat.dtype).clamp(0.0, 1.0) * text_gate
+        return feat + self._residual_scale() * route * delta
+
+
+@MODELS.register_module()
 class WeakSupportRetriever(BaseModule):
-    """CAQR-guided same-image support retrieval for weak P3 features.
+    """Reliability-guided same-image support retrieval for weak P3 features.
 
     This module keeps the open-vocabulary head unchanged. It uses the
-    class-agnostic reliability map produced by CAQR to build a compact
-    same-image memory, retrieves visual support for every P3 location, and
-    applies a zero-initialized residual refinement to P3 only.
+    class-agnostic reliability map produced by the foreground/background gate
+    to build a compact same-image memory, retrieves visual support for every
+    P3 location, and applies a zero-initialized residual refinement to P3 only.
     """
 
     def __init__(self,

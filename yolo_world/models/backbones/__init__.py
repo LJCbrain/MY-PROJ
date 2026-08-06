@@ -6,11 +6,17 @@ from .mm_backbone import (
     MultiModalYOLOBackbone,
     HuggingVisionBackbone,
     HuggingCLIPLanguageBackbone,
-    PseudoLanguageBackbone)
+    MultiScalePromptBank,
+    PseudoLanguageBackbone,
+    SemanticBoundedSphericalFusion,
+    SemanticallyGuardedClassConditionedPrompting)
 
 __all__ = [
     'MultiModalYOLOBackbone',
     'HuggingVisionBackbone',
     'HuggingCLIPLanguageBackbone',
-    'PseudoLanguageBackbone'
+    'MultiScalePromptBank',
+    'PseudoLanguageBackbone',
+    'SemanticBoundedSphericalFusion',
+    'SemanticallyGuardedClassConditionedPrompting',
 ]

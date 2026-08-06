@@ -109,9 +109,21 @@ class YOLOWorldPAFPN(YOLOv8PAFPN):
                  act_cfg=self.act_cfg))
         return MODELS.build(block_cfg)
 
+    def _get_bottom_up_text(self, txt_feats: Tensor,
+                            inner_outs: List[Tensor]) -> Tensor:
+        """Return the text features used to guide the bottom-up path.
+
+        Subclasses can override this hook to condition the neck guidance on
+        the current top-down visual features without changing the text
+        features that are returned to, or independently adapted for, the
+        detection head.
+        """
+        return txt_feats
+
     def forward(self,
                 img_feats: List[Tensor],
-                txt_feats: Tensor = None) -> tuple:
+                txt_feats: Tensor = None,
+                txt_masks: Tensor = None) -> tuple:
         """Forward function.
         including multi-level image features, text features: BxLxD
         """
@@ -136,6 +148,11 @@ class YOLOWorldPAFPN(YOLOv8PAFPN):
                 top_down_layer_inputs, txt_feats)
             inner_outs.insert(0, inner_out)
 
+        # Keep neck-side text conditioning local to the bottom-up path.  In
+        # particular, GuardPrompt still starts from the original ``txt_feats``
+        # after the neck and therefore runs in parallel with this branch.
+        bottom_up_txt_feats = self._get_bottom_up_text(txt_feats, inner_outs)
+
         # bottom-up path
         outs = [inner_outs[0]]
         for idx in range(len(self.in_channels) - 1):
@@ -143,7 +160,7 @@ class YOLOWorldPAFPN(YOLOv8PAFPN):
             feat_high = inner_outs[idx + 1]
             downsample_feat = self.downsample_layers[idx](feat_low)
             out = self.bottom_up_layers[idx](torch.cat(
-                [downsample_feat, feat_high], 1), txt_feats)
+                [downsample_feat, feat_high], 1), bottom_up_txt_feats)
             outs.append(out)
 
         # out_layers
@@ -157,36 +174,84 @@ class YOLOWorldPAFPN(YOLOv8PAFPN):
             results, self._fgbg_parts = self.fgbg_gate(
                 results,
                 txt_feats=txt_feats,
+                txt_masks=txt_masks,
                 return_parts=True)
 
         return results
 
+    def get_spatial_prompt_routing_context(self):
+        """Return detached foreground gates and reliability ranking maps."""
+        if not self._fgbg_parts:
+            raise RuntimeError(
+                'CSPR context is unavailable before the reliability gate '
+                'runs.')
+        foreground_maps = self._fgbg_parts.get('masks', None)
+        reliability_maps = self._fgbg_parts.get('reliability_maps', None)
+        if not foreground_maps or not reliability_maps:
+            raise RuntimeError(
+                'CSPR requires foreground and reliability maps from the neck.')
+        if len(foreground_maps) != len(reliability_maps):
+            raise RuntimeError(
+                'CSPR foreground and reliability levels do not match.')
+        return dict(
+            foreground_maps=tuple(
+                route.detach() for route in foreground_maps),
+            reliability_maps=tuple(
+                route.detach() for route in reliability_maps))
+
 
 @MODELS.register_module()
 class YOLOWorldWSRPAFPN(YOLOWorldPAFPN):
-    """YOLO-World PAFPN with CAQR-guided weak support retrieval.
+    """YOLO-World PAFPN with reliability-guided weak support retrieval.
 
-    CAQR is applied in ``YOLOWorldPAFPN.forward``. This subclass keeps the
-    cached CAQR parts for auxiliary losses, then uses the P3 reliability map to
-    refine P3 with same-image visual support. P4/P5 and the detection head stay
-    unchanged.
+    An optional I-Pooling branch conditions the text guidance used only by the
+    bottom-up PAFPN.  GuardPrompt remains an independent post-neck text branch
+    for the detection head.
+
+    The foreground/background gate is applied in ``YOLOWorldPAFPN.forward``.
+    This subclass keeps its cached parts and uses the fused multi-scale
+    reliability map to refine P3 with same-image visual support. P4/P5 and the
+    detection head stay unchanged.
     """
 
     def __init__(self,
                  *args,
                  wsr_cfg: ConfigType = None,
+                 ipooling_cfg: ConfigType = None,
+                 text_residual_cfg: ConfigType = None,
                  **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.wsr = MODELS.build(wsr_cfg) if wsr_cfg is not None else None
+        if ipooling_cfg is not None:
+            ipooling_cfg = copy.deepcopy(ipooling_cfg)
+            ipooling_cfg.setdefault(
+                'image_channels',
+                [int(x * self.widen_factor) for x in self.out_channels])
+            ipooling_cfg.setdefault('text_channels', self.guide_channels)
+            ipooling_cfg.setdefault('num_feats', len(self.out_channels))
+            # Keep the original YOLO-World attribute name so pretrained
+            # ``neck.text_enhancer.*`` I-Pooling weights remain loadable.
+            self.text_enhancer = MODELS.build(ipooling_cfg)
+        else:
+            self.text_enhancer = None
+        self.text_residual = (
+            MODELS.build(text_residual_cfg)
+            if text_residual_cfg is not None else None)
         self._prompt_bank_context = None
+
+    def _get_bottom_up_text(self, txt_feats: Tensor,
+                            inner_outs: List[Tensor]) -> Tensor:
+        """Apply neck-local I-Pooling without feeding it into GuardPrompt."""
+        if self.text_enhancer is None or txt_feats is None:
+            return txt_feats
+        return self.text_enhancer(txt_feats, inner_outs)
 
     def forward(self,
                 img_feats: List[Tensor],
-                txt_feats: Tensor = None) -> tuple:
+                txt_feats: Tensor = None,
+                txt_masks: Tensor = None) -> tuple:
         self._prompt_bank_context = None
-        results = super().forward(img_feats, txt_feats)
-        if self.wsr is None:
-            return results
+        results = super().forward(img_feats, txt_feats, txt_masks=txt_masks)
         if len(results) < 3:
             return results
         if not self._fgbg_parts or 'reliability_maps' not in self._fgbg_parts:
@@ -195,18 +260,41 @@ class YOLOWorldWSRPAFPN(YOLOWorldPAFPN):
         if not reliability_maps:
             return results
 
-        p3 = self.wsr(results[0], results[1], results[2],
-                      reliability_maps[0].detach())
+        fused_reliability = self._fgbg_parts.get(
+            'fused_reliability', reliability_maps[0])
+        p3 = results[0]
+        if self.wsr is not None:
+            p3 = self.wsr(p3, results[1], results[2],
+                          fused_reliability.detach())
+        if self.text_residual is not None:
+            p3 = self.text_residual(
+                p3,
+                txt_feats,
+                fused_reliability,
+                txt_masks=txt_masks)
         results = (p3, *results[1:])
-        self._prompt_bank_context = (results, tuple(reliability_maps))
+        # GuardPrompt consumes the current multi-scale visual features and
+        # reliability maps, but it must not send its text-side gradients back
+        # into C2F/Regional/WSR.  The detection head keeps using ``results``
+        # directly, so its normal visual supervision is unaffected.
+        self._prompt_bank_context = (
+            tuple(feat.detach() for feat in results),
+            tuple(route.detach() for route in reliability_maps))
         return results
 
     def get_prompt_bank_context(self):
         if self._prompt_bank_context is None:
             raise RuntimeError(
                 'Prompt-bank context is unavailable. Run the neck with '
-                'CAQR and WSR enabled before encoding prompted text.')
+                'the reliability gate and WSR enabled before encoding '
+                'prompted text.')
         return self._prompt_bank_context
+
+    def get_proposal_prior_maps(self):
+        """Return the per-level class-agnostic priors from the last forward."""
+        if not self._fgbg_parts:
+            return None
+        return tuple(self._fgbg_parts.get('reliability_maps', ()))
 
 
 @MODELS.register_module()

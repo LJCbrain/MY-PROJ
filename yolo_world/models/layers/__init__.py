@@ -10,8 +10,11 @@ from .yolo_bricks import (
     RepConvMaxSigmoidCSPLayerWithTwoConv,
     RepMaxSigmoidCSPLayerWithTwoConv,
     ClassAgnosticForegroundGate,
+    RegionalBackgroundPriorGate,
+    RegionalTextResidual,
     WeakSupportRetriever,
 )
+from .ema import IntegerSafeExpMomentumEMA
 
 __all__ = [
     'CSPLayerWithTwoConv',
@@ -22,5 +25,8 @@ __all__ = [
     'RepMaxSigmoidCSPLayerWithTwoConv',
     'ImagePoolingAttentionModule',
     'ClassAgnosticForegroundGate',
+    'RegionalBackgroundPriorGate',
+    'RegionalTextResidual',
     'WeakSupportRetriever',
+    'IntegerSafeExpMomentumEMA',
 ]

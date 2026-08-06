@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from mmcv.cnn import ConvModule
+from mmcv.ops import nms
 from mmengine.config import ConfigDict
 from mmengine.model import BaseModule
 from torch import Tensor
@@ -22,6 +23,101 @@ from mmyolo.registry import MODELS
 from mmyolo.models.dense_heads import YOLOv8HeadModule, YOLOv8Head
 from mmyolo.models.utils import gt_instances_preprocess
 from mmcv.cnn.bricks import build_norm_layer
+
+
+def _dense_contrastive_similarity(x: Tensor, w: Tensor,
+                                  use_einsum: bool) -> Tensor:
+    """Compute dense image-text similarity from normalized inputs."""
+    if use_einsum:
+        return torch.einsum('bchw,bkc->bkhw', x, w)
+
+    batch, channel, height, width = x.shape
+    num_classes = w.shape[1]
+    x = x.permute(0, 2, 3, 1).reshape(batch, -1, channel)
+    x = torch.matmul(x, w.permute(0, 2, 1))
+    return x.reshape(batch, height, width, num_classes).permute(0, 3, 1, 2)
+
+
+def _prepare_route_map(route: Tensor, x: Tensor, detach: bool) -> Tensor:
+    """Align a class-agnostic spatial route with a visual feature map."""
+    if route is None or route.dim() != 4:
+        raise ValueError('CSPR route maps must have shape [B, 1, H, W].')
+    if route.shape[1] != 1:
+        route = route.mean(dim=1, keepdim=True)
+    if route.shape[0] == 1 and x.shape[0] > 1:
+        route = route.expand(x.shape[0], -1, -1, -1)
+    if route.shape[0] != x.shape[0]:
+        raise ValueError('CSPR route and visual batch sizes do not match.')
+    if route.shape[-2:] != x.shape[-2:]:
+        route = F.interpolate(
+            route.float(),
+            size=x.shape[-2:],
+            mode='bilinear',
+            align_corners=False)
+    if detach:
+        route = route.detach()
+    return route.to(device=x.device, dtype=x.dtype).clamp(0.0, 1.0)
+
+
+def _routed_contrastive_logits(
+        x: Tensor,
+        base_w: Tensor,
+        prompt_w: Tensor,
+        gate: Tensor,
+        ranking: Tensor,
+        logit_scale: Tensor,
+        bias: Tensor,
+        use_einsum: bool,
+        mode: str,
+        topk: int,
+        detach_gate: bool) -> Tensor:
+    """Route prompted text densely in training and sparsely in inference."""
+    base_w = F.normalize(base_w, dim=-1, p=2)
+    prompt_w = F.normalize(prompt_w, dim=-1, p=2)
+    if base_w.shape != prompt_w.shape:
+        raise ValueError('CSPR base and prompted text shapes must match.')
+    if base_w.shape[0] != x.shape[0]:
+        raise ValueError('CSPR text and visual batch sizes must match.')
+
+    gate = _prepare_route_map(gate, x, detach_gate)
+    scale = logit_scale.exp()
+    base_logits = (
+        _dense_contrastive_similarity(x, base_w, use_einsum) * scale + bias)
+
+    if mode == 'dense':
+        prompt_logits = (
+            _dense_contrastive_similarity(x, prompt_w, use_einsum) * scale +
+            bias)
+        return base_logits + gate * (prompt_logits - base_logits)
+    if mode != 'sparse_topk':
+        raise ValueError(f'Unsupported CSPR mode: {mode}.')
+
+    ranking = _prepare_route_map(ranking, x, detach=True)
+    batch_size, channels, height, width = x.shape
+    num_positions = height * width
+    selected_count = min(max(int(topk), 0), num_positions)
+    if selected_count == 0:
+        return base_logits
+
+    indices = ranking.flatten(1).topk(selected_count, dim=1).indices
+    flat_visual = x.flatten(2).transpose(1, 2)
+    visual_indices = indices.unsqueeze(-1).expand(-1, -1, channels)
+    selected_visual = torch.gather(flat_visual, 1, visual_indices)
+    selected_prompt_logits = (
+        torch.einsum('bqd,bkd->bkq', selected_visual, prompt_w) * scale + bias)
+
+    num_classes = base_logits.shape[1]
+    score_indices = indices.unsqueeze(1).expand(-1, num_classes, -1)
+    flat_base = base_logits.flatten(2)
+    selected_base_logits = torch.gather(flat_base, 2, score_indices)
+    selected_gate = torch.gather(gate.flatten(2), 2, indices.unsqueeze(1))
+    selected_logits = (
+        selected_base_logits +
+        selected_gate * (selected_prompt_logits - selected_base_logits))
+
+    routed_logits = flat_base.clone()
+    routed_logits.scatter_(2, score_indices, selected_logits)
+    return routed_logits.reshape(batch_size, num_classes, height, width)
 
 
 @MODELS.register_module()
@@ -47,21 +143,18 @@ class ContrastiveHead(BaseModule):
         """Forward function of contrastive learning."""
         x = F.normalize(x, dim=1, p=2)
         w = F.normalize(w, dim=-1, p=2)
-
-        if self.use_einsum:
-            x = torch.einsum('bchw,bkc->bkhw', x, w)
-        else:
-            batch, channel, height, width = x.shape
-            _, k, _ = w.shape
-            x = x.permute(0, 2, 3, 1)  # bchw->bhwc
-            x = x.reshape(batch, -1, channel)  # bhwc->b(hw)c
-            w = w.permute(0, 2, 1)  # bkc->bck
-            x = torch.matmul(x, w)
-            x = x.reshape(batch, height, width, k)
-            x = x.permute(0, 3, 1, 2)
-
+        x = _dense_contrastive_similarity(x, w, self.use_einsum)
         x = x * self.logit_scale.exp() + self.bias
         return x
+
+    def forward_routed(self, x: Tensor, base_w: Tensor, prompt_w: Tensor,
+                       gate: Tensor, ranking: Tensor, mode: str, topk: int,
+                       detach_gate: bool) -> Tensor:
+        """Compute CSPR logits while normalizing visual features once."""
+        x = F.normalize(x, dim=1, p=2)
+        return _routed_contrastive_logits(
+            x, base_w, prompt_w, gate, ranking, self.logit_scale, self.bias,
+            self.use_einsum, mode, topk, detach_gate)
 
 
 @MODELS.register_module()
@@ -89,21 +182,18 @@ class BNContrastiveHead(BaseModule):
         """Forward function of contrastive learning."""
         x = self.norm(x)
         w = F.normalize(w, dim=-1, p=2)
-
-        if self.use_einsum:
-            x = torch.einsum('bchw,bkc->bkhw', x, w)
-        else:
-            batch, channel, height, width = x.shape
-            _, k, _ = w.shape
-            x = x.permute(0, 2, 3, 1)  # bchw->bhwc
-            x = x.reshape(batch, -1, channel)  # bhwc->b(hw)c
-            w = w.permute(0, 2, 1)  # bkc->bck
-            x = torch.matmul(x, w)
-            x = x.reshape(batch, height, width, k)
-            x = x.permute(0, 3, 1, 2)
-
+        x = _dense_contrastive_similarity(x, w, self.use_einsum)
         x = x * self.logit_scale.exp() + self.bias
         return x
+
+    def forward_routed(self, x: Tensor, base_w: Tensor, prompt_w: Tensor,
+                       gate: Tensor, ranking: Tensor, mode: str, topk: int,
+                       detach_gate: bool) -> Tensor:
+        """Compute CSPR logits while applying batch normalization once."""
+        x = self.norm(x)
+        return _routed_contrastive_logits(
+            x, base_w, prompt_w, gate, ranking, self.logit_scale, self.bias,
+            self.use_einsum, mode, topk, detach_gate)
 
 
 @MODELS.register_module()
@@ -145,12 +235,52 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
                  use_bn_head: bool = False,
                  use_einsum: bool = True,
                  freeze_all: bool = False,
+                 spatial_prompt_routing_cfg: Optional[dict] = None,
                  **kwargs) -> None:
         self.embed_dims = embed_dims
         self.use_bn_head = use_bn_head
         self.use_einsum = use_einsum
         self.freeze_all = freeze_all
+
+        routing_cfg = (
+            {} if spatial_prompt_routing_cfg is None else
+            dict(spatial_prompt_routing_cfg))
+        self.spatial_prompt_routing_enabled = bool(
+            routing_cfg.pop('enabled', False))
+        self.spatial_prompt_train_mode = routing_cfg.pop(
+            'train_mode', 'dense')
+        self.spatial_prompt_test_mode = routing_cfg.pop(
+            'test_mode', 'sparse_topk')
+        self.spatial_prompt_topk = tuple(
+            int(value) for value in routing_cfg.pop(
+                'topk_per_level', (512, 256, 128)))
+        self.spatial_prompt_gate_source = routing_cfg.pop(
+            'gate_source', 'foreground_prior')
+        self.spatial_prompt_ranking_source = routing_cfg.pop(
+            'ranking_source', 'reliability')
+        self.spatial_prompt_detach_gate = bool(
+            routing_cfg.pop('detach_gate', True))
+        if routing_cfg:
+            raise ValueError(
+                'Unknown spatial_prompt_routing_cfg fields: '
+                f'{tuple(routing_cfg)}')
+        if self.spatial_prompt_train_mode not in ('dense', 'sparse_topk'):
+            raise ValueError('CSPR train_mode must be dense or sparse_topk.')
+        if self.spatial_prompt_test_mode not in ('dense', 'sparse_topk'):
+            raise ValueError('CSPR test_mode must be dense or sparse_topk.')
+        if self.spatial_prompt_gate_source != 'foreground_prior':
+            raise ValueError(
+                'CSPR currently requires gate_source=foreground_prior.')
+        if self.spatial_prompt_ranking_source != 'reliability':
+            raise ValueError(
+                'CSPR currently requires ranking_source=reliability.')
+        if any(value < 0 for value in self.spatial_prompt_topk):
+            raise ValueError('CSPR topk_per_level values must be non-negative.')
         super().__init__(*args, **kwargs)
+        if (self.spatial_prompt_routing_enabled and
+                len(self.spatial_prompt_topk) != self.num_levels):
+            raise ValueError(
+                'CSPR topk_per_level must match the number of feature levels.')
 
     def init_weights(self, prior_prob=0.01):
         """Initialize the weight and bias of PPYOLOE head."""
@@ -243,10 +373,54 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
         if self.freeze_all:
             self._freeze_all()
 
-    def forward(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
-                txt_masks: Tensor) -> Tuple[List]:
+    def forward(self,
+                img_feats: Tuple[Tensor],
+                txt_feats: Tensor,
+                txt_masks: Tensor,
+                base_txt_feats: Optional[Tensor] = None,
+                foreground_maps: Optional[Sequence[Tensor]] = None,
+                reliability_maps: Optional[Sequence[Tensor]] = None
+                ) -> Tuple[List]:
         """Forward features from the upstream network."""
         assert len(img_feats) == self.num_levels
+        if self.spatial_prompt_routing_enabled:
+            if (base_txt_feats is None or foreground_maps is None or
+                    reliability_maps is None):
+                raise RuntimeError(
+                    'CSPR requires base text, foreground maps, and '
+                    'reliability maps.')
+            if (len(foreground_maps) != self.num_levels or
+                    len(reliability_maps) != self.num_levels):
+                raise ValueError(
+                    'CSPR requires one foreground and reliability map per '
+                    'feature level.')
+            mode = (
+                self.spatial_prompt_train_mode
+                if self.training else self.spatial_prompt_test_mode)
+            outputs = [
+                self.forward_single(
+                    img_feat,
+                    txt_feats,
+                    txt_masks,
+                    cls_pred,
+                    reg_pred,
+                    cls_contrast,
+                    base_txt_feat=base_txt_feats,
+                    foreground_map=foreground_map,
+                    reliability_map=reliability_map,
+                    routing_mode=mode,
+                    routing_topk=self.spatial_prompt_topk[level_idx])
+                for level_idx, (
+                    img_feat, cls_pred, reg_pred, cls_contrast,
+                    foreground_map, reliability_map) in enumerate(
+                        zip(img_feats, self.cls_preds, self.reg_preds,
+                            self.cls_contrasts, foreground_maps,
+                            reliability_maps))
+            ]
+            return tuple([
+                output[output_idx] for output in outputs
+            ] for output_idx in range(len(outputs[0])))
+
         txt_feats = [txt_feats for _ in range(self.num_levels)]
         txt_masks = [txt_masks for _ in range(self.num_levels)]
         return multi_apply(self.forward_single, img_feats, txt_feats,
@@ -256,11 +430,30 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
     def forward_single(self, img_feat: Tensor, txt_feat: Tensor,
                        txt_masks: Tensor, cls_pred: nn.ModuleList,
                        reg_pred: nn.ModuleList,
-                       cls_contrast: nn.ModuleList) -> Tuple:
+                       cls_contrast: nn.ModuleList,
+                       base_txt_feat: Optional[Tensor] = None,
+                       foreground_map: Optional[Tensor] = None,
+                       reliability_map: Optional[Tensor] = None,
+                       routing_mode: str = 'dense',
+                       routing_topk: int = 0) -> Tuple:
         """Forward feature of a single scale level."""
         b, _, h, w = img_feat.shape
         cls_embed = cls_pred(img_feat)
-        cls_logit = cls_contrast(cls_embed, txt_feat)
+        if base_txt_feat is None:
+            cls_logit = cls_contrast(cls_embed, txt_feat)
+        else:
+            if not hasattr(cls_contrast, 'forward_routed'):
+                raise TypeError(
+                    'The configured contrastive head does not support CSPR.')
+            cls_logit = cls_contrast.forward_routed(
+                cls_embed,
+                base_txt_feat,
+                txt_feat,
+                foreground_map,
+                reliability_map,
+                mode=routing_mode,
+                topk=routing_topk,
+                detach_gate=self.spatial_prompt_detach_gate)
 
         if txt_masks is not None:
 
@@ -288,8 +481,7 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
             bbox_preds = bbox_dist_preds
         if self.training:
             return cls_logit, bbox_preds, bbox_dist_preds
-        else:
-            return cls_logit, bbox_preds
+        return cls_logit, bbox_preds
 
 
 @MODELS.register_module()
@@ -351,24 +543,39 @@ class RepYOLOWorldHeadModule(YOLOWorldHeadModule):
 class YOLOWorldHead(YOLOv8Head):
     """YOLO-World Head
     """
-    def __init__(self, world_size=-1, *args, **kwargs) -> None:
+    def __init__(self,
+                 world_size=-1,
+                 proposal_cfg: Optional[dict] = None,
+                 *args,
+                 **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.world_size = world_size
+        self.proposal_cfg = None
+        if proposal_cfg is not None:
+            self.proposal_cfg = dict(
+                pre_nms_topk=3000, nms_iou_threshold=0.7, max_per_img=300)
+            self.proposal_cfg.update(dict(proposal_cfg))
 
     """YOLO World v8 head."""
 
-    def loss(self, img_feats: Tuple[Tensor], txt_feats: Tensor,  # 定义损失函数并接收图像与文本特征
-             txt_masks: Tensor, batch_data_samples: Union[list, dict]) -> dict:  # 接收文本掩码与批量数据样本
-        """Perform forward propagation and loss calculation of the detection head on
-         the features of the upstream network."""  # 描述函数用途，执行上游网络特征的前向传播并计算检测头的损失。
-        outs = self(img_feats, txt_feats, txt_masks)  # 执行前向传播获取头部输出
-        # Fast version  # 使用加速版损失计算流程
-        # print(batch_data_samples['bboxes_labels'])
-        loss_inputs = outs + (txt_masks,
-                              batch_data_samples['bboxes_labels'],
-                              batch_data_samples['img_metas'])  # 拼接标注框与图像元信息作为损失输入
-        losses = self.loss_by_feat(*loss_inputs)  # 基于特征输出计算具体损失
-        return losses  # 返回损失字典
+    def loss(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
+             txt_masks: Tensor,
+             batch_data_samples: Union[list, dict],
+             spatial_prompt_context: Optional[dict] = None) -> dict:
+        """Run the head and calculate detection losses."""
+        outs = self(
+            img_feats,
+            txt_feats,
+            txt_masks,
+            spatial_prompt_context=spatial_prompt_context)
+        cls_scores, bbox_preds, bbox_dist_preds = outs
+        return self.loss_by_feat(
+            cls_scores,
+            bbox_preds,
+            bbox_dist_preds,
+            txt_masks,
+            batch_data_samples['bboxes_labels'],
+            batch_data_samples['img_metas'])
 
     def loss_and_predict(
         self,
@@ -376,7 +583,8 @@ class YOLOWorldHead(YOLOv8Head):
         txt_feats: Tensor,
         txt_masks: Tensor,
         batch_data_samples: SampleList,
-        proposal_cfg: Optional[ConfigDict] = None
+        proposal_cfg: Optional[ConfigDict] = None,
+        spatial_prompt_context: Optional[dict] = None
     ) -> Tuple[dict, InstanceList]:
         """Perform forward propagation of the head, then calculate loss and
         predictions from the features and data samples.
@@ -385,28 +593,54 @@ class YOLOWorldHead(YOLOv8Head):
         (batch_gt_instances, batch_gt_instances_ignore,
          batch_img_metas) = outputs
 
-        outs = self(img_feats, txt_feats, txt_masks)
+        outs = self(
+            img_feats,
+            txt_feats,
+            txt_masks,
+            spatial_prompt_context=spatial_prompt_context)
+        cls_scores, bbox_preds, bbox_dist_preds = outs
 
-        loss_inputs = outs + (txt_masks, batch_gt_instances, batch_img_metas,
-                              batch_gt_instances_ignore)
-        losses = self.loss_by_feat(*loss_inputs)
+        losses = self.loss_by_feat(
+            cls_scores,
+            bbox_preds,
+            bbox_dist_preds,
+            txt_masks,
+            batch_gt_instances,
+            batch_img_metas,
+            batch_gt_instances_ignore)
 
-        predictions = self.predict_by_feat(*outs,
-                                           batch_img_metas=batch_img_metas,
-                                           cfg=proposal_cfg)
+        predictions = self.predict_by_feat(
+            cls_scores,
+            bbox_preds,
+            batch_img_metas=batch_img_metas,
+            cfg=proposal_cfg)
         return losses, predictions
 
-    def forward(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
-                txt_masks: Tensor) -> Tuple[List]:
+    def forward(self,
+                img_feats: Tuple[Tensor],
+                txt_feats: Tensor,
+                txt_masks: Tensor,
+                spatial_prompt_context: Optional[dict] = None) -> Tuple[List]:
         """Forward features from the upstream network."""
-        return self.head_module(img_feats, txt_feats, txt_masks)
+        context = (
+            {} if spatial_prompt_context is None else
+            dict(spatial_prompt_context))
+        allowed_fields = {
+            'base_txt_feats', 'foreground_maps', 'reliability_maps'
+        }
+        unknown_fields = set(context) - allowed_fields
+        if unknown_fields:
+            raise ValueError(
+                f'Unknown CSPR context fields: {tuple(unknown_fields)}')
+        return self.head_module(img_feats, txt_feats, txt_masks, **context)
 
     def predict(self,
                 img_feats: Tuple[Tensor],
                 txt_feats: Tensor,
                 txt_masks: Tensor,
                 batch_data_samples: SampleList,
-                rescale: bool = False) -> InstanceList:
+                rescale: bool = False,
+                spatial_prompt_context: Optional[dict] = None) -> InstanceList:
         """Perform forward propagation of the detection head and predict
         detection results on the features of the upstream network.
         执行检测头的前向传播，并在上游网络特征上预测检测结果。
@@ -414,10 +648,17 @@ class YOLOWorldHead(YOLOv8Head):
         batch_img_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
-        outs = self(img_feats, txt_feats, txt_masks)
-        predictions = self.predict_by_feat(*outs,
-                                           batch_img_metas=batch_img_metas,
-                                           rescale=rescale)
+        outs = self(
+            img_feats,
+            txt_feats,
+            txt_masks,
+            spatial_prompt_context=spatial_prompt_context)
+        cls_scores, bbox_preds = outs
+        predictions = self.predict_by_feat(
+            cls_scores,
+            bbox_preds,
+            batch_img_metas=batch_img_metas,
+            rescale=rescale)
         return predictions
 
     def aug_test(self,
@@ -534,8 +775,8 @@ class YOLOWorldHead(YOLOv8Head):
         loss_cls /= assigned_scores_sum
 
         # rescale bbox
-        assigned_bboxes /= self.stride_tensor
-        flatten_pred_bboxes /= self.stride_tensor
+        assigned_bboxes_scaled = assigned_bboxes / self.stride_tensor
+        flatten_pred_bboxes_scaled = flatten_pred_bboxes / self.stride_tensor
 
         # select positive samples mask
         num_pos = fg_mask_pre_prior.sum()
@@ -545,9 +786,11 @@ class YOLOWorldHead(YOLOv8Head):
             # iou loss
             prior_bbox_mask = fg_mask_pre_prior.unsqueeze(-1).repeat([1, 1, 4])
             pred_bboxes_pos = torch.masked_select(
-                flatten_pred_bboxes, prior_bbox_mask).reshape([-1, 4])
+                flatten_pred_bboxes_scaled,
+                prior_bbox_mask).reshape([-1, 4])
             assigned_bboxes_pos = torch.masked_select(
-                assigned_bboxes, prior_bbox_mask).reshape([-1, 4])
+                assigned_bboxes_scaled,
+                prior_bbox_mask).reshape([-1, 4])
             bbox_weight = torch.masked_select(assigned_scores.sum(-1),
                                               fg_mask_pre_prior).unsqueeze(-1)
             loss_bbox = self.loss_bbox(
@@ -558,7 +801,7 @@ class YOLOWorldHead(YOLOv8Head):
             pred_dist_pos = flatten_dist_preds[fg_mask_pre_prior]
             assigned_ltrb = self.bbox_coder.encode(
                 self.flatten_priors_train[..., :2] / self.stride_tensor,
-                assigned_bboxes,
+                assigned_bboxes_scaled,
                 max_dis=self.head_module.reg_max - 1,
                 eps=0.01)
             assigned_ltrb_pos = torch.masked_select(
@@ -570,8 +813,8 @@ class YOLOWorldHead(YOLOv8Head):
                                                                4).reshape(-1),
                                      avg_factor=assigned_scores_sum)
         else:
-            loss_bbox = flatten_pred_bboxes.sum() * 0
-            loss_dfl = flatten_pred_bboxes.sum() * 0
+            loss_bbox = flatten_pred_bboxes_scaled.sum() * 0
+            loss_dfl = flatten_pred_bboxes_scaled.sum() * 0
         if self.world_size == -1:
             _, world_size = get_dist_info()
         else:
@@ -581,6 +824,79 @@ class YOLOWorldHead(YOLOv8Head):
         return dict(loss_cls=loss_cls * num_imgs * world_size,
                     loss_bbox=loss_bbox * num_imgs * world_size,
                     loss_dfl=loss_dfl * num_imgs * world_size)
+
+    def predict_proposals_by_feat(
+            self,
+            bbox_preds: Sequence[Tensor],
+            prior_maps: Optional[Sequence[Tensor]],
+            batch_img_metas: Sequence[dict],
+            rescale: bool = True) -> List[InstanceData]:
+        """Decode class-agnostic proposals scored only by visual priors."""
+        num_imgs = len(batch_img_metas)
+        if not prior_maps or len(prior_maps) != len(bbox_preds):
+            return [
+                InstanceData(
+                    bboxes=bbox_preds[0].new_zeros((0, 4)),
+                    scores=bbox_preds[0].new_zeros((0, )),
+                    labels=bbox_preds[0].new_zeros((0, ), dtype=torch.long))
+                for _ in range(num_imgs)
+            ]
+
+        featmap_sizes = [bbox_pred.shape[2:] for bbox_pred in bbox_preds]
+        mlvl_priors = self.prior_generator.grid_priors(
+            featmap_sizes,
+            dtype=bbox_preds[0].dtype,
+            device=bbox_preds[0].device)
+        flatten_priors = torch.cat(mlvl_priors)
+        strides = torch.cat([
+            flatten_priors.new_full((size.numel() * self.num_base_priors, ),
+                                    stride)
+            for size, stride in zip(featmap_sizes, self.featmap_strides)
+        ])
+        flat_bbox_preds = torch.cat([
+            pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
+            for pred in bbox_preds
+        ], dim=1)
+        decoded = self.bbox_coder.decode(
+            flatten_priors[None], flat_bbox_preds, strides)
+        flat_scores = []
+        for prior, size in zip(prior_maps, featmap_sizes):
+            if prior.shape[-2:] != size:
+                prior = F.interpolate(
+                    prior, size=size, mode='bilinear', align_corners=False)
+            flat_scores.append(prior.reshape(num_imgs, -1))
+        flat_scores = torch.cat(flat_scores, dim=1).clamp(0.0, 1.0)
+
+        results = []
+        pre_topk = int(self.proposal_cfg['pre_nms_topk'])
+        max_per_img = int(self.proposal_cfg['max_per_img'])
+        nms_thr = float(self.proposal_cfg['nms_iou_threshold'])
+        for boxes, scores, img_meta in zip(decoded, flat_scores,
+                                           batch_img_metas):
+            topk = min(pre_topk, scores.numel())
+            scores, indices = scores.topk(topk)
+            boxes = boxes[indices]
+            _, keep = nms(boxes, scores, nms_thr)
+            keep = keep[:max_per_img]
+            boxes, scores = boxes[keep], scores[keep]
+
+            if rescale and boxes.numel() > 0:
+                pad_param = img_meta.get('pad_param', None)
+                if pad_param is not None:
+                    boxes -= boxes.new_tensor([
+                        pad_param[2], pad_param[0], pad_param[2], pad_param[0]
+                    ])
+                boxes /= boxes.new_tensor(
+                    img_meta['scale_factor']).repeat((1, 2))
+            ori_h, ori_w = img_meta['ori_shape'][:2]
+            boxes[:, 0::2].clamp_(0, ori_w)
+            boxes[:, 1::2].clamp_(0, ori_h)
+            results.append(
+                InstanceData(
+                    bboxes=boxes,
+                    scores=scores,
+                    labels=scores.new_zeros(scores.shape, dtype=torch.long)))
+        return results
 
     def predict_by_feat(self,  # 将头部输出特征转换为检测结果
                         cls_scores: List[Tensor],  # 分类分支特征列表
@@ -671,14 +987,14 @@ class YOLOWorldHead(YOLOv8Head):
                 pad_param = None  # 无padding信息时置空
 
             score_thr = cfg.get('score_thr', -1)  # 读取分数阈值
-            if objectness is not None and score_thr > 0 and not cfg.get(  # 按需求使用objectness筛选
-                    'yolox_style', False):
+            if (objectness is not None and score_thr > 0 and not cfg.get(
+                    'yolox_style', False)):
                 conf_inds = objectness > score_thr  # objectness筛选掩码
                 bboxes = bboxes[conf_inds, :]  # 过滤框
                 scores = scores[conf_inds, :]  # 过滤分类分数
                 objectness = objectness[conf_inds]  # 过滤objectness
 
-            if objectness is not None:  # 若objectness有效则融合置信度
+            if objectness is not None:
                 scores *= objectness[:, None]  # 分类分数乘以objectness
 
             if scores.shape[0] == 0:  # 若没有候选框

@@ -1,7 +1,11 @@
 _base_ = ('../../third_party/mmyolo/configs/yolov8/'
           'yolov8_l_syncbn_fast_8xb16-500e_coco.py')
 custom_imports = dict(
-    imports=['yolo_world', 'yolo_world.evaluation'],
+    imports=[
+        'yolo_world',
+        'yolo_world.evaluation',
+        'yolo_world.models.detectors.yolo_world_prior_proposal',
+    ],
     allow_failed_imports=False)
 
 # DIOR zero-shot split
@@ -56,7 +60,7 @@ DIOR_FULL_CLASSES = (
 num_classes = 20
 num_test_classes = num_classes
 num_training_classes = 16
-max_epochs = 30
+max_epochs = 50
 close_mosaic_epochs = 2
 save_epoch_intervals = 2
 text_channels = 768
@@ -71,13 +75,12 @@ load_from = 'weights/yolo_world_v2_l_clip_large_o365v1_goldg_pretrain_800ft-9df8
 
 # model settings
 model = dict(
-    type='YOLOWorldDetector',
+    type='YOLOWorldPriorProposalDetector',
     mm_neck=True,
     num_train_classes=num_training_classes,
     num_test_classes=num_test_classes,
     loss_fgbg_mask_bce_weight=0.03,
     loss_fgbg_mask_dice_weight=0.03,
-    loss_fgbg_quality_weight=0.01,
     loss_fgbg_consistency_weight=0.003,
     data_preprocessor=dict(type='YOLOWDetDataPreprocessor'),
     backbone=dict(
@@ -109,16 +112,23 @@ model = dict(
         embed_channels=neck_embed_channels,
         num_heads=neck_num_heads,
         prompt_bank_compatible=True,
-        # 保留 CAQR、WSR 和 MSPB，并加入原始 C2F 图文注意力。
+        # Original C2F text guidance + regional background prior + WSR.
         block_cfg=dict(type='MaxSigmoidCSPLayerWithTwoConv'),
         fgbg_cfg=dict(
-            type='ClassAgnosticForegroundGate',
+            type='RegionalBackgroundPriorGate',
             in_channels=[256, 512, _base_.last_stage_out_channels],
+            region_grid_size=3,
+            background_keep_ratio=0.75,
+            attention_heads=[4, 8, 8],
             hidden_ratio=0.25,
             min_hidden=16,
+            caqr_init_prob=0.01,
+            caqr_beta_max=0.3,
+            caqr_beta_warmup_iters=1000,
             max_gamma=0.15,
             gamma_init_bias=-0.3,
             gamma_warmup_iters=1000,
+            fusion_weights=(0.5, 0.25),
             return_parts=True,
         ),
         wsr_cfg=dict(
@@ -139,6 +149,10 @@ model = dict(
         )),
     bbox_head=dict(
         type='YOLOWorldHead',
+        proposal_cfg=dict(
+            pre_nms_topk=3000,
+            nms_iou_threshold=0.7,
+            max_per_img=300),
         head_module=dict(
             type='YOLOWorldHeadModule',
             use_bn_head=True,
@@ -184,7 +198,7 @@ train_pipeline = [
     *text_transform,
 ]
 
-train_pipeline_stage2 = [
+train_pipeline_close_mosaic = [
     *_base_.pre_transform,
     dict(type='YOLOv5KeepRatioResize', scale=img_scale),
     dict(
@@ -300,13 +314,12 @@ custom_hooks = [
     dict(
         type='mmdet.PipelineSwitchHook',
         switch_epoch=max_epochs - close_mosaic_epochs,
-        switch_pipeline=train_pipeline_stage2)
+        switch_pipeline=train_pipeline_close_mosaic)
 ]
 train_cfg = dict(
     max_epochs=max_epochs,
     val_interval=5,
-    dynamic_intervals=[((max_epochs - close_mosaic_epochs),
-                        _base_.val_interval_stage2)])
+    dynamic_intervals=[(20, 2)])
 
 visualizer = dict(
     type='mmdet.DetLocalVisualizer',
