@@ -460,11 +460,14 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
             # # 临时增加这一行，强制将 mask 设为 1
             # txt_masks = torch.ones_like(txt_masks)
             txt_masks = txt_masks.view(b, -1, 1, 1).expand(-1, -1, h, w)
+            # Preserve the original FP32 mask while avoiding FP16 overflow
+            # under AMP. Both values have zero sigmoid probability.
+            mask_fill_value = max(-10e6, torch.finfo(cls_logit.dtype).min)
             if self.training:
                 cls_logit = cls_logit * txt_masks
-                cls_logit[txt_masks == 0] = -10e6
+                cls_logit[txt_masks == 0] = mask_fill_value
             else:
-                cls_logit[txt_masks == 0] = -10e6
+                cls_logit[txt_masks == 0] = mask_fill_value
 
         bbox_dist_preds = reg_pred(img_feat)
         if self.reg_max > 1:
@@ -557,6 +560,10 @@ class YOLOWorldHead(YOLOv8Head):
             self.proposal_cfg.update(dict(proposal_cfg))
 
     """YOLO World v8 head."""
+
+    def classification_position_weights(self, assigned_scores, foreground, img_metas):
+        """Extension point; the original head retains its exact supervision."""
+        return None
 
     def loss(self, img_feats: Tuple[Tensor], txt_feats: Tensor,
              txt_masks: Tensor,
@@ -763,15 +770,22 @@ class YOLOWorldHead(YOLOv8Head):
 
         assigned_scores_sum = assigned_scores.sum().clamp(min=1)
 
+        partial_weight = self.classification_position_weights(
+            assigned_scores, fg_mask_pre_prior, batch_img_metas)
         if batch_text_masks is not None:
             cls_weight = batch_text_masks.view(num_imgs, 1, -1).expand(
                 -1, flatten_cls_preds.shape[1], -1).to(flatten_cls_preds)
 
             loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores)
+            if partial_weight is not None:
+                loss_cls = loss_cls * partial_weight
             _loss_cls = (loss_cls * cls_weight).sum(dim=-1)
             loss_cls = _loss_cls.sum()
         else:
-            loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores).sum()
+            loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores)
+            if partial_weight is not None:
+                loss_cls = loss_cls * partial_weight
+            loss_cls = loss_cls.sum()
         loss_cls /= assigned_scores_sum
 
         # rescale bbox

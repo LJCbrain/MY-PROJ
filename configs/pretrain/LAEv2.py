@@ -124,14 +124,7 @@ model = dict(
                 semantic_anchor_weight=(0.05 if semantic_anchor_enabled else
                                         0.0),
                 semantic_anchor_warmup_iters=1000,
-                semantic_anchor_sample_size=0),
-            semantic_fusion_cfg=dict(
-                enabled=False,
-                max_angle_deg=20,
-                eps=1e-6,
-                small_angle_eps=1e-4,
-                compute_fp32=True,
-                collect_stats=True))),
+                semantic_anchor_sample_size=0))),
     neck=dict(
         type='YOLOWorldWSRPAFPN',
         guide_channels=text_channels,

@@ -204,4 +204,5 @@ outputs/
 results/
 logs/
 work_dirs/
+/\.codex_tmp/
 /tmp/

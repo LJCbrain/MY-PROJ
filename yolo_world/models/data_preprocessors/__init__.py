@@ -1,4 +1,4 @@
 # Copyright (c) Tencent Inc. All rights reserved.
-from .data_preprocessor import YOLOWDetDataPreprocessor
+from .data_preprocessor import YOLOWDetDataPreprocessor, PartialLabelYOLOWDetDataPreprocessor
 
-__all__ = ['YOLOWDetDataPreprocessor']
+__all__ = ['YOLOWDetDataPreprocessor', 'PartialLabelYOLOWDetDataPreprocessor']

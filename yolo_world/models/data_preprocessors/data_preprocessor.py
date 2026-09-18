@@ -61,3 +61,21 @@ class YOLOWDetDataPreprocessor(DetDataPreprocessor):
             data_samples_output['is_detection'] = data_samples['is_detection']
 
         return {'inputs': inputs, 'data_samples': data_samples_output}
+
+
+@MODELS.register_module()
+class PartialLabelYOLOWDetDataPreprocessor(YOLOWDetDataPreprocessor):
+    def forward(self, data: dict, training: bool = False) -> dict:
+        partial = data['data_samples'].get('partial_labels') if training else None
+        result = super().forward(data, training)
+        if training:
+            flags = (torch.zeros(len(result['inputs']), dtype=torch.bool)
+                     if partial is None else torch.as_tensor(partial, dtype=torch.bool))
+            flags = flags.to(result['inputs'].device)
+            if flags.numel() != len(result['inputs']):
+                raise ValueError('partial_labels must contain one flag per image.')
+            result['data_samples']['partial_labels'] = flags
+            result['data_samples']['img_metas'] = [
+                dict(meta, partial_labels=bool(flag))
+                for meta, flag in zip(result['data_samples']['img_metas'], flags)]
+        return result

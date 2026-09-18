@@ -8,7 +8,6 @@ from .mm_backbone import (
     HuggingCLIPLanguageBackbone,
     MultiScalePromptBank,
     PseudoLanguageBackbone,
-    SemanticBoundedSphericalFusion,
     SemanticallyGuardedClassConditionedPrompting)
 
 __all__ = [
@@ -17,6 +16,5 @@ __all__ = [
     'HuggingCLIPLanguageBackbone',
     'MultiScalePromptBank',
     'PseudoLanguageBackbone',
-    'SemanticBoundedSphericalFusion',
     'SemanticallyGuardedClassConditionedPrompting',
 ]

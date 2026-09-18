@@ -221,6 +221,9 @@ class BaseMultiModalMixImageTransform(BaseTransform, metaclass=ABCMeta):
         results = self._update_label_text(results)
 
         # Mosaic or MixUp
+        if 'partial_labels' in results or any('partial_labels' in r for r in results['mix_results']):
+            results['partial_labels'] = any(
+                r.get('partial_labels', False) for r in [results] + results['mix_results'])
         results = self.mix_img_transform(results)
 
         if 'mix_results' in results:

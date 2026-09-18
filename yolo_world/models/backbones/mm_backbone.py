@@ -14,119 +14,6 @@ from transformers import (AutoTokenizer, AutoModel, CLIPTextConfig)
 from transformers import CLIPTextModelWithProjection as CLIPTP
 
 
-class SemanticBoundedSphericalFusion(nn.Module):
-    """Keep prompted text inside a geodesic trust region around CLIP text."""
-
-    def __init__(self,
-                 max_angle_deg: float = 15.0,
-                 eps: float = 1e-6,
-                 small_angle_eps: float = 1e-4,
-                 compute_fp32: bool = True,
-                 collect_stats: bool = True) -> None:
-        super().__init__()
-        if not 0.0 <= max_angle_deg <= 180.0:
-            raise ValueError('max_angle_deg must be in [0, 180].')
-        self.max_angle_deg = float(max_angle_deg)
-        self.eps = float(eps)
-        self.small_angle_eps = float(small_angle_eps)
-        self.compute_fp32 = bool(compute_fp32)
-        self.collect_stats = bool(collect_stats)
-        self.last_stats: Dict[str, Tensor] = {}
-
-    def forward(self,
-                original: Tensor,
-                prompted: Tensor,
-                text_mask: Optional[Tensor] = None) -> Tensor:
-        if original.shape != prompted.shape:
-            raise ValueError('original and prompted text must share a shape.')
-        if original.dim() != 3:
-            raise ValueError('text features must have shape [B, N, D].')
-
-        output_dtype = prompted.dtype
-        work_dtype = torch.float32 if self.compute_fp32 else prompted.dtype
-        original_unit = F.normalize(
-            original.detach().to(work_dtype), dim=-1, eps=self.eps)
-        prompted_unit = F.normalize(
-            prompted.to(work_dtype), dim=-1, eps=self.eps)
-        dot = (original_unit * prompted_unit).sum(dim=-1).clamp(-1.0, 1.0)
-        safe_dot = dot.clamp(-1.0 + self.eps, 1.0 - self.eps)
-        theta = torch.acos(safe_dot)
-        near_same = dot >= torch.cos(
-            dot.new_tensor(self.small_angle_eps))
-        theta = torch.where(near_same, torch.zeros_like(theta), theta)
-
-        max_angle = theta.new_tensor(self.max_angle_deg * torch.pi / 180.0)
-        if self.max_angle_deg >= 180.0:
-            fused = prompted_unit
-            alpha = torch.ones_like(theta)
-            clipped = torch.zeros_like(theta, dtype=torch.bool)
-        elif self.max_angle_deg <= 0.0:
-            fused = original_unit + prompted_unit * 0.0
-            alpha = torch.zeros_like(theta)
-            clipped = theta > self.small_angle_eps
-        else:
-            target_theta = theta.clamp_max(max_angle)
-            alpha = torch.where(
-                theta > self.small_angle_eps,
-                target_theta / theta.clamp_min(self.eps),
-                torch.ones_like(theta))
-            clipped = theta > max_angle
-
-            tangent = prompted_unit - dot.unsqueeze(-1) * original_unit
-            tangent_norm = tangent.norm(dim=-1, keepdim=True)
-            tangent_unit = tangent / tangent_norm.clamp_min(self.eps)
-            projected = (
-                torch.cos(target_theta).unsqueeze(-1) * original_unit +
-                torch.sin(target_theta).unsqueeze(-1) * tangent_unit)
-            projected = torch.where(
-                (tangent_norm > self.eps).expand_as(projected),
-                projected,
-                original_unit)
-            fused = torch.where(
-                clipped.unsqueeze(-1), projected, prompted_unit)
-            fused = F.normalize(fused, dim=-1, eps=self.eps)
-
-        if text_mask is not None:
-            valid_mask = text_mask.to(
-                device=fused.device, dtype=torch.bool)
-            if valid_mask.shape != fused.shape[:2]:
-                raise ValueError('text_mask must have shape [B, N].')
-            fused = torch.where(
-                valid_mask.unsqueeze(-1), fused, original_unit)
-        else:
-            valid_mask = torch.ones_like(theta, dtype=torch.bool)
-
-        if self.collect_stats:
-            self._collect_stats(theta, alpha, clipped, valid_mask)
-        return fused.to(output_dtype)
-
-    def _collect_stats(self, theta: Tensor, alpha: Tensor, clipped: Tensor,
-                       valid_mask: Tensor) -> None:
-        valid_theta = theta.detach().masked_select(valid_mask)
-        valid_alpha = alpha.detach().masked_select(valid_mask)
-        valid_clipped = clipped.detach().masked_select(valid_mask)
-        if valid_theta.numel() == 0:
-            zero = theta.detach().new_zeros(())
-            self.last_stats = {
-                'semantic_angle_mean_deg': zero,
-                'semantic_angle_p95_deg': zero,
-                'semantic_angle_max_deg': zero,
-                'semantic_clip_rate': zero,
-                'semantic_alpha_mean': zero,
-            }
-            return
-
-        radians_to_degrees = 180.0 / torch.pi
-        angle_deg = valid_theta.float() * radians_to_degrees
-        self.last_stats = {
-            'semantic_angle_mean_deg': angle_deg.mean(),
-            'semantic_angle_p95_deg': torch.quantile(angle_deg, 0.95),
-            'semantic_angle_max_deg': angle_deg.max(),
-            'semantic_clip_rate': valid_clipped.float().mean(),
-            'semantic_alpha_mean': valid_alpha.float().mean(),
-        }
-
-
 class SemanticallyGuardedClassConditionedPrompting(nn.Module):
     """Semantically Guarded Class-Conditioned Prompting router."""
 
@@ -811,7 +698,6 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                  pad_value: str = '',
                  training_use_cache: bool = False,
                  prompt_bank_cfg: Optional[ConfigType] = None,
-                 semantic_fusion_cfg: Optional[ConfigType] = None,
                  init_cfg: OptMultiConfig = None) -> None:
 
         super().__init__(init_cfg=init_cfg)
@@ -825,7 +711,6 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                                                      attention_dropout=dropout)
         self.model = CLIPTP.from_pretrained(model_name, config=clip_config)
         self.prompt_bank = None
-        self.semantic_fusion = None
         self._prompt_bank_losses = {}
         self._last_base_text_features = None
         self.semantic_anchor_texts = ()
@@ -856,12 +741,6 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                 prompt_bank_cfg.setdefault('text_hidden_size',
                                            clip_config.hidden_size)
                 self.prompt_bank = MultiScalePromptBank(**prompt_bank_cfg)
-        if semantic_fusion_cfg is not None:
-            semantic_fusion_cfg = dict(semantic_fusion_cfg)
-            enabled = semantic_fusion_cfg.pop('enabled', True)
-            if enabled:
-                self.semantic_fusion = SemanticBoundedSphericalFusion(
-                    **semantic_fusion_cfg)
         self._freeze_modules()
 
     def forward_tokenizer(self, texts):
@@ -925,13 +804,6 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                 batch_size, num_classes, -1)
             self._add_semantic_anchor_loss(
                 image_features, reliability_maps)
-            if self.semantic_fusion is not None:
-                txt_feats = self.semantic_fusion(
-                    base_text_features, txt_feats, valid_text_mask)
-                self._prompt_bank_losses.update({
-                    f'guard_prompt_{name}': value
-                    for name, value in self.semantic_fusion.last_stats.items()
-                })
         elif len(self.frozen_modules) > 0:
             with torch.no_grad():
                 txt_outputs = self.model(**text_inputs)
@@ -995,6 +867,8 @@ class HuggingCLIPLanguageBackbone(BaseModule):
             image_idx = row // num_classes
             class_idx = row % num_classes
             valid_len = int(valid_lens[row].item())
+            # Preserve the sequence used by DIOR 2.15:
+            # [BOS] + prompt tokens + class tokens (including EOS).
             class_ids = input_ids[row, 1:valid_len]
             if class_ids.numel() > available_class_len:
                 if available_class_len == 1:
@@ -1009,7 +883,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                 token_embeds[row, :1],
                 (prompt_tokens[image_idx, class_idx]
                  if prompt_tokens.dim() == 4 else
-                 prompt_tokens[image_idx]),
+                  prompt_tokens[image_idx]),
                 class_embeds,
             ],
                                    dim=0)
@@ -1338,4 +1212,3 @@ class MultiModalYOLOBackbone(BaseModule):
         if not self.has_text_prompt_bank:
             return None
         return self.text_model.get_last_base_text_features()
-

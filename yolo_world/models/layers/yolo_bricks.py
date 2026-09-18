@@ -42,6 +42,11 @@ class MaxSigmoidAttnBlock(BaseModule):
         self.num_heads = num_heads
         self.head_channels = embed_channels // num_heads
         self.use_einsum = use_einsum
+        # Opt-in routing export; ordinary attention outputs/checkpoint keys
+        # remain unchanged. The owning neck supplies the current text mask.
+        self.capture_route = False
+        self.route_text_mask = None
+        self.last_route = None
 
         self.embed_conv = ConvModule(
             in_channels,
@@ -85,6 +90,25 @@ class MaxSigmoidAttnBlock(BaseModule):
             guide = guide.permute(0, 2, 3, 1)
             attn_weight = torch.matmul(embed, guide)
             attn_weight = attn_weight.reshape(batch, m, height, width, n)
+
+        if self.capture_route:
+            route_logits = attn_weight.detach().float()
+            valid = self.route_text_mask
+            if valid is not None:
+                if valid.shape != (B, route_logits.shape[-1]):
+                    raise ValueError('Routing text mask must have shape B x T.')
+                valid = valid.to(device=x.device, dtype=torch.bool)
+                route_logits = route_logits.masked_fill(
+                    ~valid[:, None, None, None, :], -torch.inf)
+            route_logits = route_logits.max(dim=-1)[0]
+            route_logits = route_logits / (self.head_channels**0.5)
+            route = (route_logits +
+                     self.bias.detach().float()[None, :, None, None]).sigmoid()
+            route = route.mean(dim=1, keepdim=True)
+            if valid is not None:
+                route = torch.where(valid.any(dim=1)[:, None, None, None],
+                                    route, torch.full_like(route, 0.5))
+            self.last_route = route
 
         attn_weight = attn_weight.max(dim=-1)[0]
         attn_weight = attn_weight / (self.head_channels**0.5)
@@ -643,11 +667,13 @@ class EfficientCSPLayerWithTwoConv(CSPLayerWithTwoConv):
 
 @MODELS.register_module()
 class ClassAgnosticForegroundGate(BaseModule):
-    """Class-agnostic quality recalibration for multi-level features.
+    """Class-agnostic foreground recalibration for multi-level features.
 
     The historical class name is retained for checkpoint and configuration
-    compatibility. The foreground mask, quality map, and dynamic gamma form
-    a visual reliability map that softly recalibrates each feature level.
+    compatibility. A foreground mask and dynamic gamma softly recalibrate
+    each feature level without using text or a separate quality branch.
+    Optional P3/P4/P5 fusion preserves the regional gate's WSR interface;
+    leaving it disabled retains the historical P3-only routing behavior.
     """
 
     def __init__(self,
@@ -664,16 +690,27 @@ class ClassAgnosticForegroundGate(BaseModule):
                                              momentum=0.03,
                                              eps=0.001),
                  act_cfg: ConfigType = dict(type='SiLU', inplace=True),
-                 init_cfg: OptMultiConfig = None) -> None:
+                 init_cfg: OptMultiConfig = None,
+                 fusion_weights: Tuple[float, float] = None) -> None:
         super().__init__(init_cfg=init_cfg)
+        if fusion_weights is not None:
+            if len(in_channels) != 3 or len(fusion_weights) != 2:
+                raise ValueError(
+                    'Foreground fusion expects P3/P4/P5 and two weights.')
+            if any(not 0 <= weight <= 1 for weight in fusion_weights):
+                raise ValueError(
+                    'Foreground fusion weights must be in [0, 1].')
+        self.fusion_weights = (
+            tuple(float(weight) for weight in fusion_weights)
+            if fusion_weights is not None else None)
         self.max_gamma = max_gamma
         self.gamma_warmup_iters = int(gamma_warmup_iters)
         self.return_parts = return_parts
         self.mask_convs = nn.ModuleList()
-        self.quality_convs = nn.ModuleList()
         self.gamma_mlps = nn.ModuleList()
+        # Preserve the residual warm-up across checkpoints and EMA reloads.
         self.register_buffer(
-            '_gamma_step', torch.zeros((), dtype=torch.long), persistent=False)
+            '_gamma_step', torch.zeros((), dtype=torch.long), persistent=True)
 
         for c in in_channels:
             hidden = max(min_hidden, int(c * hidden_ratio))
@@ -681,15 +718,6 @@ class ClassAgnosticForegroundGate(BaseModule):
             self.mask_convs.append(
                 nn.Sequential(
                     ConvModule(c,
-                               hidden,
-                               3,
-                               padding=1,
-                               norm_cfg=norm_cfg,
-                               act_cfg=act_cfg),
-                    nn.Conv2d(hidden, 1, 1)))
-            self.quality_convs.append(
-                nn.Sequential(
-                    ConvModule(2 * c + 1,
                                hidden,
                                3,
                                padding=1,
@@ -731,36 +759,39 @@ class ClassAgnosticForegroundGate(BaseModule):
             return_parts = self.return_parts
         out_feats = []
         masks = []
-        qualities = []
         recalib_maps = []
         gammas = []
         gamma_scale = self._gamma_warmup_scale()
 
-        for feat, mask_conv, quality_conv, gamma_mlp in zip(
-                feats, self.mask_convs, self.quality_convs,
-                self.gamma_mlps):
+        for feat, mask_conv, gamma_mlp in zip(feats, self.mask_convs,
+                                              self.gamma_mlps):
             mask = torch.sigmoid(mask_conv(feat))
-            masked_feat = feat * mask
-            quality_input = torch.cat((feat, masked_feat, mask), dim=1)
-            quality = torch.sigmoid(quality_conv(quality_input))
-            recalib = mask * quality
             gamma = self.max_gamma * torch.sigmoid(gamma_mlp(feat))
             gamma = gamma.view(-1, 1, 1, 1) * gamma_scale
-            out = feat * (1.0 + gamma * recalib)
+            out = feat * (1.0 + gamma * mask)
 
             out_feats.append(out)
             masks.append(mask)
-            qualities.append(quality)
-            recalib_maps.append(recalib)
+            recalib_maps.append(mask)
             gammas.append(gamma)
 
         out_feats = tuple(out_feats)
         if return_parts:
-            return out_feats, dict(masks=masks,
-                                   qualities=qualities,
-                                   recalib_maps=recalib_maps,
-                                   reliability_maps=recalib_maps,
-                                   gammas=gammas)
+            parts = dict(masks=masks,
+                         recalib_maps=recalib_maps,
+                         reliability_maps=recalib_maps,
+                         gammas=gammas)
+            if self.fusion_weights is not None:
+                target_size = masks[0].shape[-2:]
+                p4 = F.interpolate(
+                    masks[1], target_size, mode='bilinear', align_corners=False)
+                p5 = F.interpolate(
+                    masks[2], target_size, mode='bilinear', align_corners=False)
+                w4, w5 = self.fusion_weights
+                parts['fused_reliability'] = (
+                    1.0 - (1.0 - masks[0]) * (1.0 - w4 * p4) *
+                    (1.0 - w5 * p5)).clamp(0.0, 1.0)
+            return out_feats, parts
         return out_feats
 
 
@@ -793,6 +824,7 @@ class RegionalBackgroundPriorGate(BaseModule):
                  gamma_warmup_iters: int = 1000,
                  fusion_weights: Tuple[float, float] = (0.5, 0.25),
                  use_caqr: bool = True,
+                 build_caqr_modules: bool = True,
                  direct_feature_boost: bool = True,
                  return_parts: bool = True,
                  norm_cfg: ConfigType = dict(type='BN',
@@ -818,6 +850,8 @@ class RegionalBackgroundPriorGate(BaseModule):
         self.gamma_warmup_iters = int(gamma_warmup_iters)
         self.fusion_weights = tuple(float(v) for v in fusion_weights)
         self.use_caqr = bool(use_caqr)
+        if self.use_caqr and not build_caqr_modules:
+            raise ValueError('use_caqr requires build_caqr_modules=True.')
         self.direct_feature_boost = bool(direct_feature_boost)
         self.return_parts = bool(return_parts)
 
@@ -829,9 +863,10 @@ class RegionalBackgroundPriorGate(BaseModule):
         # do not silently restart the residual warm-up.
         self.register_buffer(
             '_gamma_step', torch.zeros((), dtype=torch.long), persistent=True)
-        self.register_buffer(
-            '_caqr_beta_step', torch.zeros((), dtype=torch.long),
-            persistent=True)
+        if build_caqr_modules:
+            self.register_buffer(
+                '_caqr_beta_step', torch.zeros((), dtype=torch.long),
+                persistent=True)
 
         caqr_bias = torch.logit(
             torch.tensor(float(caqr_init_prob)).clamp(1e-6, 1 - 1e-6))
@@ -848,22 +883,17 @@ class RegionalBackgroundPriorGate(BaseModule):
             self.region_attentions.append(attention)
             self.region_norms.append(nn.LayerNorm(channels))
 
-            hidden = max(min_hidden, int(channels * hidden_ratio))
-            caqr_mask_conv = nn.Sequential(
-                ConvModule(channels,
-                           hidden,
-                           3,
-                           padding=1,
-                           norm_cfg=norm_cfg,
-                           act_cfg=act_cfg),
-                nn.Conv2d(hidden, 1, 1))
-            # With beta=0 at the start of training, this branch is initially
-            # inert. Its low prior prevents an abrupt background boost later.
-            nn.init.constant_(caqr_mask_conv[-1].weight, 0.0)
-            nn.init.constant_(caqr_mask_conv[-1].bias, float(caqr_bias))
-            if not self.use_caqr:
-                caqr_mask_conv.requires_grad_(False)
-            self.caqr_mask_convs.append(caqr_mask_conv)
+            if build_caqr_modules:
+                hidden = max(min_hidden, int(channels * hidden_ratio))
+                caqr_mask_conv = nn.Sequential(
+                    ConvModule(channels, hidden, 3, padding=1,
+                               norm_cfg=norm_cfg, act_cfg=act_cfg),
+                    nn.Conv2d(hidden, 1, 1))
+                nn.init.constant_(caqr_mask_conv[-1].weight, 0.0)
+                nn.init.constant_(caqr_mask_conv[-1].bias, float(caqr_bias))
+                if not self.use_caqr:
+                    caqr_mask_conv.requires_grad_(False)
+                self.caqr_mask_convs.append(caqr_mask_conv)
 
             gamma_hidden = max(min_hidden, int(channels * gamma_hidden_ratio))
             gamma_mlp = nn.Sequential(
@@ -985,13 +1015,13 @@ class RegionalBackgroundPriorGate(BaseModule):
         out_feats, masks = [], []
         regional_priors, caqr_masks = [], []
         recalib_maps, gammas = [], []
-        for feat, attention, token_norm, caqr_mask_conv, gamma_mlp in zip(
+        for level, (feat, attention, token_norm, gamma_mlp) in enumerate(zip(
                 feats, self.region_attentions, self.region_norms,
-                self.caqr_mask_convs, self.gamma_mlps):
+                self.gamma_mlps)):
             regional_prior = self._regional_foreground_prior(
                 feat, attention, token_norm)
             if self.use_caqr:
-                caqr_mask = torch.sigmoid(caqr_mask_conv(feat))
+                caqr_mask = torch.sigmoid(self.caqr_mask_convs[level](feat))
                 # P_safe = 1 - (1 - P_region) * (1 - beta * C).
                 foreground_prior = 1.0 - (
                     (1.0 - regional_prior) * (1.0 - caqr_beta * caqr_mask))
@@ -1024,6 +1054,102 @@ class RegionalBackgroundPriorGate(BaseModule):
             caqr_beta=caqr_beta,
             recalib_maps=recalib_maps,
             reliability_maps=recalib_maps,
+            fused_reliability=fused,
+            gammas=gammas)
+
+
+@MODELS.register_module()
+class CAQRPrimaryRegionalAuxGate(RegionalBackgroundPriorGate):
+    """Use local CAQR as the foreground map and Regional as bounded context.
+
+    The Regional prior only adjusts uncertain CAQR locations. Confident CAQR
+    background/foreground predictions remain unchanged, so the Regional branch
+    cannot dominate the final routing map. The local CAQR masks are exposed as
+    ``masks`` for direct bbox-mask supervision, while the combined maps are
+    used for feature recalibration, cross-scale consistency, and WSR routing.
+    """
+
+    def __init__(self,
+                 *args,
+                 regional_aux_strength: float = 0.2,
+                 regional_aux_warmup_iters: int = 1000,
+                 **kwargs) -> None:
+        if not 0 <= regional_aux_strength <= 0.5:
+            raise ValueError('regional_aux_strength must be in [0, 0.5].')
+        if regional_aux_warmup_iters < 0:
+            raise ValueError('regional_aux_warmup_iters must be non-negative.')
+        if kwargs.pop('use_caqr', True) is not True:
+            raise ValueError('CAQRPrimaryRegionalAuxGate requires CAQR.')
+        if ('caqr_beta_max' in kwargs or
+                'caqr_beta_warmup_iters' in kwargs):
+            raise ValueError(
+                'Use regional_aux_strength and regional_aux_warmup_iters.')
+        # Reuse the persistent historical beta state for the auxiliary warm-up
+        # so Regional checkpoints keep a compatible state-dict structure.
+        kwargs['use_caqr'] = True
+        kwargs['caqr_beta_max'] = float(regional_aux_strength)
+        kwargs['caqr_beta_warmup_iters'] = int(regional_aux_warmup_iters)
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _combine_priors(caqr_mask: Tensor, regional_prior: Tensor,
+                        aux_strength: float) -> Tensor:
+        """Let Regional alter CAQR only in proportion to CAQR uncertainty."""
+        uncertainty = 4.0 * caqr_mask * (1.0 - caqr_mask)
+        combined = caqr_mask + (
+            aux_strength * uncertainty * (regional_prior - 0.5))
+        return combined.clamp(0.0, 1.0)
+
+    def forward(self,
+                feats,
+                txt_feats=None,
+                txt_masks=None,
+                return_parts: bool = None):
+        del txt_feats, txt_masks
+        if return_parts is None:
+            return_parts = self.return_parts
+        if len(feats) != len(self.region_attentions):
+            raise ValueError('Feature levels do not match configured channels.')
+
+        gamma_scale = (
+            self._gamma_warmup_scale() if self.direct_feature_boost else 0.0)
+        aux_strength = self._caqr_beta()
+        out_feats, caqr_masks = [], []
+        regional_priors, combined_maps, gammas = [], [], []
+        for feat, attention, token_norm, caqr_mask_conv, gamma_mlp in zip(
+                feats, self.region_attentions, self.region_norms,
+                self.caqr_mask_convs, self.gamma_mlps):
+            regional_prior = self._regional_foreground_prior(
+                feat, attention, token_norm)
+            caqr_mask = torch.sigmoid(caqr_mask_conv(feat))
+            combined = self._combine_priors(
+                caqr_mask, regional_prior, aux_strength)
+
+            if self.direct_feature_boost:
+                gamma = self.max_gamma * torch.sigmoid(gamma_mlp(feat))
+                gamma = gamma.view(-1, 1, 1, 1) * gamma_scale
+                out_feats.append(feat * (1.0 + gamma * combined))
+            else:
+                gamma = feat.new_zeros((feat.shape[0], 1, 1, 1))
+                out_feats.append(feat)
+            caqr_masks.append(caqr_mask)
+            regional_priors.append(regional_prior)
+            combined_maps.append(combined)
+            gammas.append(gamma)
+
+        out_feats = tuple(out_feats)
+        if not return_parts:
+            return out_feats
+        fused = self._fuse_reliability_maps(combined_maps)
+        return out_feats, dict(
+            # Supervise CAQR directly; Regional remains an auxiliary prior.
+            masks=caqr_masks,
+            caqr_masks=caqr_masks,
+            regional_priors=regional_priors,
+            regional_aux_strength=aux_strength,
+            combined_maps=combined_maps,
+            recalib_maps=combined_maps,
+            reliability_maps=combined_maps,
             fused_reliability=fused,
             gammas=gammas)
 

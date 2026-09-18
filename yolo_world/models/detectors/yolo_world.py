@@ -305,7 +305,7 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
 
     def extract_feat(  # 定义特征提取函数
             self, batch_inputs: Tensor,  # 输入图像张量
-            batch_data_samples: SampleList) -> Tuple[Tuple[Tensor], Tensor]:  # 输入样本信息，返�?(img_feats, txt_feats, txt_masks)
+            batch_data_samples: SampleList, return_backbone_feats: bool = False):  # 输入样本信息，返�?(img_feats, txt_feats, txt_masks)
         """Extract features."""  # 文档字符串：提取图像和文本特�?
         #
         # txt_masks = None#修改部分
@@ -341,6 +341,7 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             # embeddings are still generated below for the detection head.
             guide_txt_feats, guide_txt_masks = self.backbone.forward_text(texts)
             img_feats = self.backbone.forward_image(batch_inputs)
+            backbone_feats = img_feats
             img_feats = self.neck(
                 img_feats, guide_txt_feats, txt_masks=guide_txt_masks)
             prompt_features, reliability_maps = \
@@ -361,14 +362,18 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             neck_applied = True
         elif txt_feats is not None:
             img_feats = self.backbone.forward_image(batch_inputs)
+            backbone_feats = img_feats
         else:
             img_feats, (txt_feats, txt_masks) = self.backbone(
                 batch_inputs, texts)
+            backbone_feats = img_feats
         if self.with_neck and not neck_applied:  # 如果模型配置�?neck
             if self.mm_neck:  # 如果使用多模�?neck
                 img_feats = self.neck(img_feats, txt_feats)  # neck 同时接收图像和文本特�?
             else:  # 普�?neck
                 img_feats = self.neck(img_feats)  # neck 只接收图像特�?
+        if return_backbone_feats:
+            return img_feats, txt_feats, txt_masks, backbone_feats
         return img_feats, txt_feats, txt_masks  # 返回图像特征、文本特征和文本 mask
 
 

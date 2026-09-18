@@ -140,10 +140,10 @@ def parse_args() -> argparse.Namespace:
         description='Audit and test RT-OVAD Table III upper protocol on '
                     'DIOR and DOTA-v1.0 validation data.')
     parser.add_argument(
-        '--config', default='configs/pretrain/DIOR_DOTAv1.py',
+        '--config', default='configs/pretrain/DIOR_DOTAv2.5.py',
         help='Config that defines all four *_val_dataset/evaluator objects.')
     parser.add_argument(
-        '--checkpoint', default="work_dirs/DIOR_DOTAv2.5/best_coco_bbox_mAP_50_HM_epoch_28.pth",
+        '--checkpoint', default="work_dirs/DIOR_DOTAv2.5_ALL/best_coco_bbox_mAP_50_HM_epoch_20.pth",
         help='Checkpoint to test. Required unless --audit-only is used.')
     parser.add_argument(
         '--work-dir', default='work_dirs/DIOR_DOTAv1/table3_upper_val',

@@ -255,9 +255,17 @@ class YOLOWorldWSRPAFPN(YOLOWorldPAFPN):
         if len(results) < 3:
             return results
         if not self._fgbg_parts or 'reliability_maps' not in self._fgbg_parts:
+            # A prompt-bank ablation may intentionally disable every visual
+            # prior.  In that case expose the ordinary neck features and an
+            # explicit ``None`` reliability input instead of making prompted
+            # text encoding depend on a CAQR/Regional gate.
+            self._prompt_bank_context = (
+                tuple(feat.detach() for feat in results), None)
             return results
         reliability_maps = self._fgbg_parts['reliability_maps']
         if not reliability_maps:
+            self._prompt_bank_context = (
+                tuple(feat.detach() for feat in results), None)
             return results
 
         fused_reliability = self._fgbg_parts.get(
@@ -286,8 +294,7 @@ class YOLOWorldWSRPAFPN(YOLOWorldPAFPN):
         if self._prompt_bank_context is None:
             raise RuntimeError(
                 'Prompt-bank context is unavailable. Run the neck with '
-                'the reliability gate and WSR enabled before encoding '
-                'prompted text.')
+                'image features before encoding prompted text.')
         return self._prompt_bank_context
 
     def get_proposal_prior_maps(self):
@@ -295,6 +302,219 @@ class YOLOWorldWSRPAFPN(YOLOWorldPAFPN):
         if not self._fgbg_parts:
             return None
         return tuple(self._fgbg_parts.get('reliability_maps', ()))
+
+
+class _ParallelVisualResidualFusion(nn.Module):
+    """Fuse a bounded text-free visual residual into text-aware features."""
+
+    def __init__(self,
+                 visual_channels: List[int],
+                 output_channels: List[int],
+                 max_scale: float = 0.1,
+                 init_scale: float = 0.05,
+                 warmup_iters: int = 1000,
+                 detach_prior: bool = True) -> None:
+        super().__init__()
+        if len(visual_channels) != len(output_channels):
+            raise ValueError(
+                'visual_channels and output_channels must have equal length.')
+        if max_scale <= 0:
+            raise ValueError('max_scale must be positive.')
+        if not 0 <= init_scale <= max_scale:
+            raise ValueError('init_scale must be in [0, max_scale].')
+        if warmup_iters < 0:
+            raise ValueError('warmup_iters must be non-negative.')
+
+        self.max_scale = float(max_scale)
+        self.warmup_iters = int(warmup_iters)
+        self.detach_prior = bool(detach_prior)
+        self.projections = nn.ModuleList()
+        for in_channels, out_channels in zip(
+                visual_channels, output_channels):
+            projection = nn.Sequential(
+                nn.Conv2d(
+                    int(in_channels),
+                    int(out_channels),
+                    kernel_size=3,
+                    padding=1,
+                    bias=False),
+                nn.BatchNorm2d(int(out_channels), eps=0.001, momentum=0.03),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(
+                    int(out_channels),
+                    int(out_channels),
+                    kernel_size=1,
+                    bias=False))
+            # Preserve the pretrained YOLO-World path at initialization.  The
+            # final projection still receives gradients through the bounded
+            # non-zero scale and learns the visual residual gradually.
+            nn.init.constant_(projection[-1].weight, 0.0)
+            self.projections.append(projection)
+
+        ratio = min(max(init_scale / self.max_scale, 1e-4), 1 - 1e-4)
+        scale_logits = torch.full(
+            (len(visual_channels), ), float(ratio), dtype=torch.float32)
+        self.scale_logits = nn.Parameter(torch.logit(scale_logits))
+        self.register_buffer(
+            '_fusion_step', torch.zeros((), dtype=torch.long), persistent=True)
+        self.last_scales = torch.zeros(len(visual_channels))
+
+    def _warmup_scale(self) -> float:
+        if self.warmup_iters <= 0:
+            return 1.0
+        if self.training:
+            self._fusion_step.add_(1)
+        return min(
+            float(self._fusion_step.item()) / float(self.warmup_iters), 1.0)
+
+    def forward(self, text_features, visual_features, prior_maps):
+        if not (len(text_features) == len(visual_features) ==
+                len(prior_maps) == len(self.projections)):
+            raise ValueError('Parallel visual fusion levels do not match.')
+        warmup = self._warmup_scale()
+        scales = (
+            self.max_scale * torch.sigmoid(self.scale_logits) * warmup)
+        outputs = []
+        for level, (text_feature, visual_feature, prior, projection) in enumerate(
+                zip(text_features, visual_features, prior_maps,
+                    self.projections)):
+            residual = projection(visual_feature)
+            if residual.shape[-2:] != text_feature.shape[-2:]:
+                residual = torch.nn.functional.interpolate(
+                    residual,
+                    size=text_feature.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False)
+            if residual.shape[1] != text_feature.shape[1]:
+                raise ValueError(
+                    'Projected visual and text-aware channels must match.')
+            if prior.shape[-2:] != text_feature.shape[-2:]:
+                prior = torch.nn.functional.interpolate(
+                    prior.float(),
+                    size=text_feature.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False)
+            if self.detach_prior:
+                prior = prior.detach()
+            prior = prior.to(device=residual.device, dtype=residual.dtype)
+            scale = scales[level].to(
+                device=residual.device, dtype=residual.dtype)
+            outputs.append(text_feature + scale * prior * residual)
+        self.last_scales = scales.detach()
+        return tuple(outputs)
+
+
+@MODELS.register_module()
+class ParallelVisualPriorYOLOWorldWSRPAFPN(YOLOWorldWSRPAFPN):
+    """YOLO-World neck with an independent pre-text visual-prior branch.
+
+    The class-agnostic prior is computed from reduced backbone features before
+    any text-guided CSP layer.  The original text-aware PAFPN is preserved, and
+    a zero-initialized, bounded visual residual is fused after its output.  WSR
+    then refines P3, while GuardPrompt consumes detached post-WSR features and
+    the same detached per-level prior maps.
+    """
+
+    def __init__(self,
+                 *args,
+                 visual_prior_cfg: ConfigType,
+                 visual_residual_cfg: ConfigType,
+                 **kwargs) -> None:
+        if visual_prior_cfg is None:
+            raise ValueError('visual_prior_cfg is required.')
+        if visual_residual_cfg is None:
+            raise ValueError('visual_residual_cfg is required.')
+        if kwargs.pop('fgbg_cfg', None) is not None:
+            raise ValueError(
+                'Use visual_prior_cfg instead of the post-PAFPN fgbg_cfg.')
+        super().__init__(*args, fgbg_cfg=None, **kwargs)
+        self.visual_prior_gate = MODELS.build(
+            copy.deepcopy(visual_prior_cfg))
+        if getattr(self.visual_prior_gate, 'direct_feature_boost', False):
+            raise ValueError(
+                'The parallel prior must set direct_feature_boost=False; '
+                'visual fusion is handled by the isolated residual branch.')
+        self.visual_residual_fusion = _ParallelVisualResidualFusion(
+            **copy.deepcopy(visual_residual_cfg))
+        self._parallel_visual_scales = None
+
+    def forward(self,
+                img_feats: List[Tensor],
+                txt_feats: Tensor = None,
+                txt_masks: Tensor = None) -> tuple:
+        """Run visual prior and text-aware PAFPN in parallel."""
+        self._prompt_bank_context = None
+        self._parallel_visual_scales = None
+        self._fgbg_parts = None
+        assert len(img_feats) == len(self.in_channels)
+
+        # This is the sole shared prefix.  The prior is produced here, before
+        # any top-down or bottom-up text-guided CSP operation.
+        reduce_outs = [
+            self.reduce_layers[idx](img_feats[idx])
+            for idx in range(len(self.in_channels))
+        ]
+        _, prior_parts = self.visual_prior_gate(
+            tuple(reduce_outs), return_parts=True)
+        if not prior_parts or not prior_parts.get('reliability_maps', None):
+            raise RuntimeError(
+                'The parallel visual prior did not return reliability maps.')
+        self._fgbg_parts = prior_parts
+
+        # Original YOLO-World text-aware top-down path.
+        inner_outs = [reduce_outs[-1]]
+        for idx in range(len(self.in_channels) - 1, 0, -1):
+            feat_high = inner_outs[0]
+            feat_low = reduce_outs[idx - 1]
+            upsample_feat = self.upsample_layers[
+                len(self.in_channels) - 1 - idx](feat_high)
+            if self.upsample_feats_cat_first:
+                layer_inputs = torch.cat([upsample_feat, feat_low], 1)
+            else:
+                layer_inputs = torch.cat([feat_low, upsample_feat], 1)
+            inner_out = self.top_down_layers[
+                len(self.in_channels) - 1 - idx](layer_inputs, txt_feats)
+            inner_outs.insert(0, inner_out)
+
+        bottom_up_txt_feats = self._get_bottom_up_text(txt_feats, inner_outs)
+        outs = [inner_outs[0]]
+        for idx in range(len(self.in_channels) - 1):
+            feat_low = outs[-1]
+            feat_high = inner_outs[idx + 1]
+            downsample_feat = self.downsample_layers[idx](feat_low)
+            out = self.bottom_up_layers[idx](
+                torch.cat([downsample_feat, feat_high], 1),
+                bottom_up_txt_feats)
+            outs.append(out)
+
+        text_features = tuple(
+            self.out_layers[idx](outs[idx])
+            for idx in range(len(self.in_channels)))
+        reliability_maps = prior_parts['reliability_maps']
+        results = self.visual_residual_fusion(
+            text_features, tuple(reduce_outs), reliability_maps)
+        self._parallel_visual_scales = (
+            self.visual_residual_fusion.last_scales)
+
+        fused_reliability = prior_parts.get(
+            'fused_reliability', reliability_maps[0])
+        p3 = results[0]
+        if self.wsr is not None:
+            p3 = self.wsr(
+                p3, results[1], results[2], fused_reliability.detach())
+        if self.text_residual is not None:
+            p3 = self.text_residual(
+                p3,
+                txt_feats,
+                fused_reliability,
+                txt_masks=txt_masks)
+        results = (p3, *results[1:])
+
+        # Prompt losses cannot rewrite the visual prior or visual features.
+        self._prompt_bank_context = (
+            tuple(feat.detach() for feat in results),
+            tuple(route.detach() for route in reliability_maps))
+        return results
 
 
 @MODELS.register_module()
