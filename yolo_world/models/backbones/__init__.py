@@ -9,6 +9,8 @@ from .mm_backbone import (
     MultiScalePromptBank,
     PseudoLanguageBackbone,
     SemanticallyGuardedClassConditionedPrompting)
+from .remoteclip_vit import RemoteCLIPViTL14Backbone
+from .mona_backbone import MonaMultiModalYOLOBackbone, MonaYOLOv8CSPDarknet
 
 __all__ = [
     'MultiModalYOLOBackbone',
@@ -17,4 +19,7 @@ __all__ = [
     'MultiScalePromptBank',
     'PseudoLanguageBackbone',
     'SemanticallyGuardedClassConditionedPrompting',
+    'RemoteCLIPViTL14Backbone',
+    'MonaMultiModalYOLOBackbone',
+    'MonaYOLOv8CSPDarknet',
 ]

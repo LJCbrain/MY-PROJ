@@ -2,9 +2,16 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import os
+import sys
 # # 【新增】强制将 CUDA 设备设为不可见，迫使 PyTorch 使用 CPU 运行
 # os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 import os.path as osp
+
+# Direct script execution puts tools/, rather than the repository root, on
+# sys.path. Make local custom modules importable before loading the config.
+proj_root = osp.abspath(osp.join(osp.dirname(__file__), '..'))
+if proj_root not in sys.path:
+    sys.path.insert(0, proj_root)
 
 from mmdet.engine.hooks.utils import trigger_visualization_hook
 from mmengine.config import Config, ConfigDict, DictAction

@@ -14,6 +14,64 @@ from transformers import (AutoTokenizer, AutoModel, CLIPTextConfig)
 from transformers import CLIPTextModelWithProjection as CLIPTP
 
 
+def text_topology_kl_loss(prompted_embeddings: Tensor,
+                          reference_embeddings: Tensor,
+                          valid_mask: Optional[Tensor] = None,
+                          temperature: float = 0.1) -> Tensor:
+    """Preserve the inter-class similarity topology of frozen CLIP text.
+
+    The diagonal is excluded so the trivial self-similarity of one cannot
+    dominate the neighbourhood distribution. ``reference_embeddings`` is
+    always treated as a fixed teacher.
+    """
+    if prompted_embeddings.ndim != 3:
+        raise ValueError('prompted_embeddings must have shape [B, C, D].')
+    if temperature <= 0:
+        raise ValueError('text topology temperature must be positive.')
+    batch_size, num_classes, embed_dim = prompted_embeddings.shape
+    if reference_embeddings.ndim == 2:
+        if reference_embeddings.shape != (num_classes, embed_dim):
+            raise ValueError(
+                'reference_embeddings must have shape [C, D] or [B, C, D].')
+        reference_embeddings = reference_embeddings.unsqueeze(0).expand(
+            batch_size, -1, -1)
+    elif reference_embeddings.shape != prompted_embeddings.shape:
+        raise ValueError(
+            'reference_embeddings must have shape [C, D] or [B, C, D].')
+
+    if valid_mask is None:
+        valid_mask = torch.ones(
+            batch_size, num_classes, device=prompted_embeddings.device,
+            dtype=torch.bool)
+    elif valid_mask.shape != (batch_size, num_classes):
+        raise ValueError('valid_mask must have shape [B, C].')
+    else:
+        valid_mask = valid_mask.to(
+            device=prompted_embeddings.device, dtype=torch.bool)
+
+    prompted = F.normalize(prompted_embeddings.float(), dim=-1)
+    reference = F.normalize(
+        reference_embeddings.detach().to(prompted).float(), dim=-1)
+    prompted_logits = prompted @ prompted.transpose(-1, -2) / temperature
+    reference_logits = reference @ reference.transpose(-1, -2) / temperature
+
+    diagonal = torch.eye(
+        num_classes, device=prompted.device, dtype=torch.bool).unsqueeze(0)
+    pair_mask = valid_mask.unsqueeze(1).expand(-1, num_classes, -1)
+    pair_mask = pair_mask & ~diagonal
+    minimum = torch.finfo(prompted_logits.dtype).min
+    prompted_log_prob = F.log_softmax(
+        prompted_logits.masked_fill(~pair_mask, minimum), dim=-1)
+    reference_prob = F.softmax(
+        reference_logits.masked_fill(~pair_mask, minimum), dim=-1)
+    row_kl = F.kl_div(
+        prompted_log_prob, reference_prob, reduction='none').sum(dim=-1)
+    valid_rows = valid_mask & (valid_mask.sum(dim=-1, keepdim=True) > 1)
+    if not valid_rows.any():
+        return prompted_embeddings.float().sum() * 0
+    return row_kl[valid_rows].mean()
+
+
 class SemanticallyGuardedClassConditionedPrompting(nn.Module):
     """Semantically Guarded Class-Conditioned Prompting router."""
 
@@ -718,6 +776,8 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         self.semantic_anchor_weight = 0.0
         self.semantic_anchor_warmup_iters = 0
         self.semantic_anchor_sample_size = 0
+        self.text_topology_weight = 0.0
+        self.text_topology_temperature = 0.1
         # This cache is intentionally not a buffer: it is initialized lazily
         # after EMA constructs its shadow model and must not be EMA-swapped.
         self._semantic_anchor_embeddings = None
@@ -738,6 +798,16 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                     prompt_bank_cfg.pop('semantic_anchor_warmup_iters', 0))
                 self.semantic_anchor_sample_size = int(
                     prompt_bank_cfg.pop('semantic_anchor_sample_size', 0))
+                self.text_topology_weight = float(prompt_bank_cfg.pop(
+                    'text_topology_weight', 0.0))
+                self.text_topology_temperature = float(prompt_bank_cfg.pop(
+                    'text_topology_temperature', 0.1))
+                if self.text_topology_weight < 0:
+                    raise ValueError(
+                        'text_topology_weight must be non-negative.')
+                if self.text_topology_temperature <= 0:
+                    raise ValueError(
+                        'text_topology_temperature must be positive.')
                 prompt_bank_cfg.setdefault('text_hidden_size',
                                            clip_config.hidden_size)
                 self.prompt_bank = MultiScalePromptBank(**prompt_bank_cfg)
@@ -898,7 +968,9 @@ class HuggingCLIPLanguageBackbone(BaseModule):
     def _add_semantic_anchor_loss(
             self, image_features: Sequence[Tensor],
             reliability_maps: Optional[Sequence[Tensor]]) -> None:
-        if (not self.training or self.semantic_anchor_weight <= 0 or
+        if (not self.training or
+                (self.semantic_anchor_weight <= 0 and
+                 self.text_topology_weight <= 0) or
                 not self.semantic_anchor_texts):
             return
         original_embeddings = self._get_semantic_anchor_embeddings()
@@ -945,10 +1017,19 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         original_embeddings = original_embeddings.to(
             device=prompted_embeddings.device,
             dtype=prompted_embeddings.dtype)
-        anchor_loss = 1.0 - (prompted_embeddings *
-                             original_embeddings.unsqueeze(0)).sum(dim=-1)
-        self._prompt_bank_losses['loss_guard_prompt_anchor'] = (
-            anchor_loss.mean() * self._semantic_anchor_scale())
+        if self.semantic_anchor_weight > 0:
+            anchor_loss = 1.0 - (prompted_embeddings *
+                                 original_embeddings.unsqueeze(0)).sum(dim=-1)
+            self._prompt_bank_losses['loss_guard_prompt_anchor'] = (
+                anchor_loss.mean() * self._semantic_anchor_scale())
+        if self.text_topology_weight > 0:
+            topology_loss = text_topology_kl_loss(
+                prompted_embeddings,
+                original_embeddings,
+                valid_mask=anchor_mask,
+                temperature=self.text_topology_temperature)
+            self._prompt_bank_losses['loss_text_topology'] = (
+                topology_loss * self.text_topology_weight)
 
     def _get_semantic_anchor_embeddings(self) -> Tensor:
         if self._semantic_anchor_embeddings is not None:

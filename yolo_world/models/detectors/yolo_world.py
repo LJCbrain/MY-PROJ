@@ -24,6 +24,7 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
                  loss_fgbg_mask_bce_weight: Optional[float] = None,
                  loss_fgbg_mask_dice_weight: Optional[float] = None,
                  loss_fgbg_consistency_weight: float = 0.0,
+                 neck_guide_texts: Optional[Tuple[str, ...]] = None,
                  **kwargs) -> None:  # 关键字参数，透传给父�?/-> None 表示这个函数不会返回任何有意义的�?
         self.mm_neck = mm_neck  # 保存是否使用多模�?neck 的配�?
         self.num_train_classes = num_train_classes  # 保存训练类别�?
@@ -36,6 +37,68 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             loss_fgbg_mask_dice_weight)
         self.loss_fgbg_consistency_weight = loss_fgbg_consistency_weight
         super().__init__(*args, **kwargs)  # 调用父类构造函数完成基础初始�?
+        if isinstance(neck_guide_texts, (str, bytes)):
+            raise ValueError('neck_guide_texts must be a sequence of class names.')
+        self.neck_guide_texts = (
+            tuple(neck_guide_texts) if neck_guide_texts is not None else None)
+        if self.neck_guide_texts is not None:
+            if (not self.neck_guide_texts or
+                    any(not isinstance(name, str) or not name.strip()
+                        for name in self.neck_guide_texts) or
+                    len(set(self.neck_guide_texts)) != len(self.neck_guide_texts)):
+                raise ValueError('The neck vocabulary needs unique nonempty class names.')
+            if not self.with_neck or not self.mm_neck:
+                raise ValueError('A full neck vocabulary requires a multimodal neck.')
+        # Keep derived text caches out of EMAHook's positional buffer swaps.
+        self._neck_guide_text_features = None
+        self._neck_guide_text_cache_key = None
+
+    def _apply(self, fn, *args, **kwargs):
+        self._neck_guide_text_features = None
+        self._neck_guide_text_cache_key = None
+        return super()._apply(fn, *args, **kwargs)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Clear the frozen bank for native and MMEngine checkpoint loading,
+        # including older PyTorch without public post-load hooks.
+        self._neck_guide_text_features = None
+        self._neck_guide_text_cache_key = None
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys,
+            unexpected_keys, error_msgs)
+
+    def _get_neck_text_guide(self, classification_text, classification_mask,
+                             batch_size):
+        """Separate full-vocabulary neck guidance from classifier labels.
+
+        GuardPrompt receives the current classifier's original embeddings,
+        not the full graph bank or its GCN-modified features.
+        """
+        if self.neck_guide_texts is None:
+            return classification_text, classification_mask
+        if (self._neck_guide_text_features is None or
+                self._neck_guide_text_cache_key != self.neck_guide_texts):
+            language = getattr(self.backbone, 'text_model', None)
+            encoder = getattr(language, 'model', None)
+            if encoder is not None and any(p.requires_grad for p in encoder.parameters()):
+                raise RuntimeError('Caching the full neck vocabulary requires frozen CLIP.')
+            with torch.no_grad(), torch.autocast(
+                    device_type=classification_text.device.type, enabled=False):
+                features, masks = self.backbone.forward_text([list(self.neck_guide_texts)])
+                expected = (1, len(self.neck_guide_texts), self.neck.guide_channels)
+                if features.shape != expected:
+                    raise ValueError('Full neck vocabulary embeddings must have shape 1 x N x D.')
+                if masks is not None and (masks.shape != expected[:2] or not masks.bool().all()):
+                    raise ValueError('The full neck vocabulary cannot contain padding text.')
+                self._neck_guide_text_features = F.normalize(
+                    features.detach().float(), dim=-1)
+            self._neck_guide_text_cache_key = self.neck_guide_texts
+        features = self._neck_guide_text_features.to(
+            device=classification_text.device, dtype=next(self.neck.parameters()).dtype)
+        masks = torch.ones((1, features.shape[1]), device=features.device,
+                           dtype=torch.bool)
+        return features.expand(batch_size, -1, -1), masks.expand(batch_size, -1)
 
     def loss(self, batch_inputs: Tensor,  # 定义 loss 计算函数，batch_inputs 为图像张�?
              batch_data_samples: SampleList) -> Union[dict, list]:  # batch_data_samples 为标注信息列表，返回字典或列表形式的损失
@@ -342,8 +405,10 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             guide_txt_feats, guide_txt_masks = self.backbone.forward_text(texts)
             img_feats = self.backbone.forward_image(batch_inputs)
             backbone_feats = img_feats
+            neck_txt_feats, neck_txt_masks = self._get_neck_text_guide(
+                guide_txt_feats, guide_txt_masks, batch_inputs.shape[0])
             img_feats = self.neck(
-                img_feats, guide_txt_feats, txt_masks=guide_txt_masks)
+                img_feats, neck_txt_feats, txt_masks=neck_txt_masks)
             prompt_features, reliability_maps = \
                 self.neck.get_prompt_bank_context()
             positive_class_mask = None
@@ -369,7 +434,13 @@ class YOLOWorldDetector(YOLODetector):  # 定义 YOLOWorldDetector 类，继承 
             backbone_feats = img_feats
         if self.with_neck and not neck_applied:  # 如果模型配置�?neck
             if self.mm_neck:  # 如果使用多模�?neck
-                img_feats = self.neck(img_feats, txt_feats)  # neck 同时接收图像和文本特�?
+                if self.neck_guide_texts is None:
+                    img_feats = self.neck(img_feats, txt_feats)  # neck 同时接收图像和文本特�?
+                else:
+                    neck_txt_feats, neck_txt_masks = self._get_neck_text_guide(
+                        txt_feats, txt_masks, batch_inputs.shape[0])
+                    img_feats = self.neck(img_feats, neck_txt_feats,
+                                          txt_masks=neck_txt_masks)
             else:  # 普�?neck
                 img_feats = self.neck(img_feats)  # neck 只接收图像特�?
         if return_backbone_feats:

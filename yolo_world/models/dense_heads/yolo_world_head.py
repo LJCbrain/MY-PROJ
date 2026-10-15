@@ -24,6 +24,9 @@ from mmyolo.models.dense_heads import YOLOv8HeadModule, YOLOv8Head
 from mmyolo.models.utils import gt_instances_preprocess
 from mmcv.cnn.bricks import build_norm_layer
 
+from ..layers.lsk import ResidualLSKBlock
+from ..layers.mona import Mona2d
+
 
 def _dense_contrastive_similarity(x: Tensor, w: Tensor,
                                   use_einsum: bool) -> Tensor:
@@ -36,6 +39,22 @@ def _dense_contrastive_similarity(x: Tensor, w: Tensor,
     x = x.permute(0, 2, 3, 1).reshape(batch, -1, channel)
     x = torch.matmul(x, w.permute(0, 2, 1))
     return x.reshape(batch, height, width, num_classes).permute(0, 3, 1, 2)
+
+
+def _normalize_text_features(
+        w: Tensor, text_norm: Optional[nn.Module] = None) -> Tensor:
+    """Normalize each text embedding with L2 or an optional BatchNorm1d."""
+    if text_norm is None:
+        return F.normalize(w, dim=-1, p=2)
+
+    if w.dim() != 3:
+        raise ValueError('Text features must have shape [B, K, D].')
+    batch_size, num_classes, embed_dims = w.shape
+    if embed_dims != text_norm.num_features:
+        raise ValueError(
+            'Text feature dimension must match text BatchNorm channels.')
+    w = text_norm(w.reshape(batch_size * num_classes, embed_dims))
+    return w.reshape(batch_size, num_classes, embed_dims)
 
 
 def _prepare_route_map(route: Tensor, x: Tensor, detach: bool) -> Tensor:
@@ -70,14 +89,23 @@ def _routed_contrastive_logits(
         use_einsum: bool,
         mode: str,
         topk: int,
-        detach_gate: bool) -> Tensor:
+        detach_gate: bool,
+        text_norm: Optional[nn.Module] = None) -> Tensor:
     """Route prompted text densely in training and sparsely in inference."""
-    base_w = F.normalize(base_w, dim=-1, p=2)
-    prompt_w = F.normalize(prompt_w, dim=-1, p=2)
     if base_w.shape != prompt_w.shape:
         raise ValueError('CSPR base and prompted text shapes must match.')
     if base_w.shape[0] != x.shape[0]:
         raise ValueError('CSPR text and visual batch sizes must match.')
+    if text_norm is None:
+        base_w = _normalize_text_features(base_w)
+        prompt_w = _normalize_text_features(prompt_w)
+    else:
+        # Normalize both banks in one BN call so they use identical batch
+        # statistics and update the running statistics only once.
+        num_classes = base_w.shape[1]
+        text = _normalize_text_features(
+            torch.cat((base_w, prompt_w), dim=1), text_norm)
+        base_w, prompt_w = text.split(num_classes, dim=1)
 
     gate = _prepare_route_map(gate, x, detach_gate)
     scale = logit_scale.exp()
@@ -169,10 +197,16 @@ class BNContrastiveHead(BaseModule):
                  embed_dims: int,
                  norm_cfg: ConfigDict,
                  init_cfg: OptConfigType = None,
-                 use_einsum: bool = True) -> None:
+                 use_einsum: bool = True,
+                 text_norm_cfg: Optional[ConfigDict] = None) -> None:
 
         super().__init__(init_cfg=init_cfg)
         self.norm = build_norm_layer(norm_cfg, embed_dims)[1]
+        self.text_norm = None
+        if text_norm_cfg is not None:
+            self.text_norm = build_norm_layer(text_norm_cfg, embed_dims)[1]
+            if not isinstance(self.text_norm, nn.BatchNorm1d):
+                raise TypeError('text_norm_cfg must build BatchNorm1d.')
         self.bias = nn.Parameter(torch.zeros([]))
         # use -1.0 is more stable
         self.logit_scale = nn.Parameter(-1.0 * torch.ones([]))
@@ -181,7 +215,7 @@ class BNContrastiveHead(BaseModule):
     def forward(self, x: Tensor, w: Tensor) -> Tensor:
         """Forward function of contrastive learning."""
         x = self.norm(x)
-        w = F.normalize(w, dim=-1, p=2)
+        w = _normalize_text_features(w, self.text_norm)
         x = _dense_contrastive_similarity(x, w, self.use_einsum)
         x = x * self.logit_scale.exp() + self.bias
         return x
@@ -193,7 +227,7 @@ class BNContrastiveHead(BaseModule):
         x = self.norm(x)
         return _routed_contrastive_logits(
             x, base_w, prompt_w, gate, ranking, self.logit_scale, self.bias,
-            self.use_einsum, mode, topk, detach_gate)
+            self.use_einsum, mode, topk, detach_gate, self.text_norm)
 
 
 @MODELS.register_module()
@@ -228,6 +262,10 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
     Args:
         embed_dims (int): embed dim for text feautures and image features
         use_bn_head (bool): use batch normalization head
+        lsk_cfg (dict, optional): Small LSK residuals on selected classification
+            inputs. None preserves the original head and checkpoint keys.
+        mona_cfg (dict, optional): Mona on selected classification inputs.
+            None or enabled=False preserves the original checkpoint keys.
     """
     def __init__(self,
                  *args,
@@ -235,12 +273,20 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
                  use_bn_head: bool = False,
                  use_einsum: bool = True,
                  freeze_all: bool = False,
+                 text_norm_cfg: Optional[dict] = None,
                  spatial_prompt_routing_cfg: Optional[dict] = None,
+                 lsk_cfg: Optional[dict] = None,
+                 mona_cfg: Optional[dict] = None,
                  **kwargs) -> None:
         self.embed_dims = embed_dims
         self.use_bn_head = use_bn_head
         self.use_einsum = use_einsum
         self.freeze_all = freeze_all
+        self.text_norm_cfg = text_norm_cfg
+        self.lsk_cfg = copy.deepcopy(lsk_cfg)
+        self.mona_cfg = copy.deepcopy(mona_cfg)
+        if self.text_norm_cfg is not None and not self.use_bn_head:
+            raise ValueError('text_norm_cfg requires use_bn_head=True.')
 
         routing_cfg = (
             {} if spatial_prompt_routing_cfg is None else
@@ -348,11 +394,47 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
                 self.cls_contrasts.append(
                     BNContrastiveHead(self.embed_dims,
                                       self.norm_cfg,
-                                      use_einsum=self.use_einsum))
+                                      use_einsum=self.use_einsum,
+                                      text_norm_cfg=self.text_norm_cfg))
             else:
                 self.cls_contrasts.append(
                     ContrastiveHead(self.embed_dims,
                                     use_einsum=self.use_einsum))
+
+        self.cls_lsk = None
+        if self.lsk_cfg is not None:
+            lsk_cfg = dict(self.lsk_cfg)
+            levels = tuple(lsk_cfg.pop('active_levels', (2,)))
+            init_scale = lsk_cfg.pop('init_scale', 1e-2)
+            if lsk_cfg:
+                raise ValueError(f'Unknown lsk_cfg fields: {tuple(lsk_cfg)}')
+            if (not levels or len(set(levels)) != len(levels)
+                    or any(not isinstance(i, int) or isinstance(i, bool)
+                           or i < 0 or i >= self.num_levels for i in levels)):
+                raise ValueError('LSK active_levels must be unique valid feature indices.')
+            self.cls_lsk = nn.ModuleList([
+                ResidualLSKBlock(channels, init_scale=init_scale)
+                if level in levels else nn.Identity()
+                for level, channels in enumerate(self.in_channels)
+            ])
+
+        self.cls_mona = None
+        if self.mona_cfg is not None:
+            mona_cfg = dict(self.mona_cfg)
+            enabled = mona_cfg.pop('enabled', True)
+            levels = tuple(mona_cfg.pop('active_levels', (0,)))
+            if enabled:
+                if self.cls_lsk is not None:
+                    raise ValueError('Enable either Mona or LSK on classification inputs.')
+                if (not levels or len(set(levels)) != len(levels)
+                        or any(not isinstance(i, int) or isinstance(i, bool)
+                               or i < 0 or i >= self.num_levels for i in levels)):
+                    raise ValueError('Mona active_levels must be unique valid feature indices.')
+                self.cls_mona = nn.ModuleList([
+                    Mona2d(channels, **mona_cfg)
+                    if level in levels else nn.Identity()
+                    for level, channels in enumerate(self.in_channels)
+                ])
 
         proj = torch.arange(self.reg_max, dtype=torch.float)
         self.register_buffer('proj', proj, persistent=False)
@@ -383,6 +465,7 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
                 ) -> Tuple[List]:
         """Forward features from the upstream network."""
         assert len(img_feats) == self.num_levels
+        cls_adapters = self.cls_mona if self.cls_mona is not None else self.cls_lsk
         if self.spatial_prompt_routing_enabled:
             if (base_txt_feats is None or foreground_maps is None or
                     reliability_maps is None):
@@ -409,7 +492,9 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
                     foreground_map=foreground_map,
                     reliability_map=reliability_map,
                     routing_mode=mode,
-                    routing_topk=self.spatial_prompt_topk[level_idx])
+                    routing_topk=self.spatial_prompt_topk[level_idx],
+                    cls_adapter=(cls_adapters[level_idx]
+                                 if cls_adapters is not None else None))
                 for level_idx, (
                     img_feat, cls_pred, reg_pred, cls_contrast,
                     foreground_map, reliability_map) in enumerate(
@@ -420,6 +505,17 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
             return tuple([
                 output[output_idx] for output in outputs
             ] for output_idx in range(len(outputs[0])))
+
+        if cls_adapters is not None:
+            outputs = [
+                self.forward_single(
+                    img_feat, txt_feats, txt_masks, cls_pred, reg_pred,
+                    cls_contrast, cls_adapter=cls_adapter)
+                for img_feat, cls_pred, reg_pred, cls_contrast, cls_adapter in zip(
+                    img_feats, self.cls_preds, self.reg_preds,
+                    self.cls_contrasts, cls_adapters)
+            ]
+            return tuple(map(list, zip(*outputs)))
 
         txt_feats = [txt_feats for _ in range(self.num_levels)]
         txt_masks = [txt_masks for _ in range(self.num_levels)]
@@ -435,10 +531,12 @@ class YOLOWorldHeadModule(YOLOv8HeadModule):
                        foreground_map: Optional[Tensor] = None,
                        reliability_map: Optional[Tensor] = None,
                        routing_mode: str = 'dense',
-                       routing_topk: int = 0) -> Tuple:
+                       routing_topk: int = 0,
+                       cls_adapter: Optional[nn.Module] = None) -> Tuple:
         """Forward feature of a single scale level."""
         b, _, h, w = img_feat.shape
-        cls_embed = cls_pred(img_feat)
+        cls_feat = img_feat if cls_adapter is None else cls_adapter(img_feat)
+        cls_embed = cls_pred(cls_feat)
         if base_txt_feat is None:
             cls_logit = cls_contrast(cls_embed, txt_feat)
         else:
@@ -513,10 +611,12 @@ class RepYOLOWorldHeadModule(YOLOWorldHeadModule):
 
     def forward_single(self, img_feat: Tensor, cls_pred: nn.ModuleList,
                        reg_pred: nn.ModuleList,
-                       cls_contrast: nn.ModuleList) -> Tuple:
+                       cls_contrast: nn.ModuleList,
+                       cls_adapter: Optional[nn.Module] = None) -> Tuple:
         """Forward features from the upstream network."""
         b, _, h, w = img_feat.shape
-        cls_embed = cls_pred(img_feat)
+        cls_feat = img_feat if cls_adapter is None else cls_adapter(img_feat)
+        cls_embed = cls_pred(cls_feat)
         cls_logit = cls_contrast(cls_embed)
         bbox_dist_preds = reg_pred(img_feat)
         if self.reg_max > 1:
@@ -538,6 +638,10 @@ class RepYOLOWorldHeadModule(YOLOWorldHeadModule):
 
     def forward(self, img_feats: Tuple[Tensor]) -> Tuple[List]:
         assert len(img_feats) == self.num_levels
+        cls_adapters = self.cls_mona if self.cls_mona is not None else self.cls_lsk
+        if cls_adapters is not None:
+            return multi_apply(self.forward_single, img_feats, self.cls_preds,
+                               self.reg_preds, self.cls_contrasts, cls_adapters)
         return multi_apply(self.forward_single, img_feats, self.cls_preds,
                            self.reg_preds, self.cls_contrasts)
 
@@ -947,6 +1051,25 @@ class YOLOWorldHead(YOLOv8Head):
         multi_label &= self.num_classes > 1  # 在单类情况下禁用multi_label
         cfg.multi_label = multi_label  # 回写multi_label结果
 
+        # Optional Base-only inference gate. IDs index the current text/class
+        # columns, not the annotation category IDs or the Base training order.
+        base_score_thr = cfg.get('base_score_thr', None)
+        base_class_ids = cfg.get('base_class_ids', None)
+        if base_score_thr is not None:
+            if (isinstance(base_score_thr, bool)
+                    or not isinstance(base_score_thr, (int, float))
+                    or not math.isfinite(base_score_thr)
+                    or not 0 <= base_score_thr <= 1):
+                raise ValueError('base_score_thr must be a finite score in [0, 1].')
+            if (not isinstance(base_class_ids, (list, tuple))
+                    or not base_class_ids
+                    or any(isinstance(index, bool) or not isinstance(index, int)
+                           or not 0 <= index < self.num_classes
+                           for index in base_class_ids)
+                    or len(set(base_class_ids)) != len(base_class_ids)):
+                raise ValueError(
+                    'base_class_ids must contain unique valid class-column indices.')
+
         num_imgs = len(batch_img_metas)  # 批次图像数量
         featmap_sizes = [cls_score.shape[2:] for cls_score in cls_scores]  # 各层特征图尺寸
 
@@ -1018,6 +1141,15 @@ class YOLOWorldHead(YOLOv8Head):
                 empty_results.labels = scores[:, 0].int()  # 占位标签
                 results_list.append(empty_results)  # 保存空结果
                 continue  # 处理下一张图像
+
+            if base_score_thr is not None:
+                # Reject individual Base entries before global top-k/NMS;
+                # keep all eligible labels, original scores and box coordinates.
+                # DIOR 2.17 passes no objectness factor, so scores are sigmoid
+                # class scores here. If supplied, factors were applied above.
+                base_scores = scores[:, base_class_ids]
+                scores[:, base_class_ids] = base_scores.masked_fill(
+                    base_scores < base_score_thr, float('-inf'))
 
             nms_pre = cfg.get('nms_pre', 100000)  # NMS前保留数量
             if cfg.multi_label is False:  # 单标签模式
