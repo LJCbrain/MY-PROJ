@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "provenance": "Generic aerial appearance descriptions authored without DIOR images, annotations, predictions or evaluation results. Freeze before experiments; not copied from or tuned against the test set.",
+  "classes": [
+    {
+      "name": "airplane",
+      "description": "From above, an airplane has an elongated fuselage, two lateral wings and a smaller tail. Its rigid, roughly cross-shaped silhouette may appear on a paved apron or runway."
+    },
+    {
+      "name": "airport",
+      "description": "From above, an airport is a large paved complex with long straight runways, connecting taxiways and broad parking aprons. Terminal buildings and parked aircraft may accompany the organized layout."
+    },
+    {
+      "name": "baseballfield",
+      "description": "From above, a baseball field has a diamond-shaped infield within a fan-shaped outfield. Contrasting dirt and grass regions and a curved outer boundary form its characteristic layout."
+    },
+    {
+      "name": "basketballcourt",
+      "description": "From above, a basketball court is a rectangular playing surface with a center circle, straight boundary lines and painted key areas near both short ends. The markings are arranged symmetrically."
+    },
+    {
+      "name": "bridge",
+      "description": "From above, a bridge is a narrow elongated deck spanning water or another gap. It connects routes on opposite sides and may show supporting structures or a shadow beside the deck."
+    },
+    {
+      "name": "chimney",
+      "description": "From above, a chimney is a narrow upright tower with a small round or polygonal top, often near industrial buildings. A long thin shadow may reveal its height."
+    },
+    {
+      "name": "dam",
+      "description": "From above, a dam is a thick straight or curved barrier across a river or valley. A broad reservoir often lies on one side, with a narrower channel or spillway on the other."
+    },
+    {
+      "name": "Expressway-Service-area",
+      "description": "From above, an expressway service area is a group of buildings and parking lots beside a highway. Access ramps connect the complex to the road, often with open parking rows and a fuel canopy."
+    },
+    {
+      "name": "Expressway-toll-station",
+      "description": "From above, an expressway toll station is a row of booths or a broad canopy crossing multiple parallel traffic lanes. The road widens around the aligned lanes and narrows beyond them."
+    },
+    {
+      "name": "golffield",
+      "description": "From above, a golf course is a large irregular green landscape with elongated fairways, small rounded greens, pale sand bunkers and occasional ponds. Its grassy patches form a dispersed layout."
+    },
+    {
+      "name": "groundtrackfield",
+      "description": "From above, a ground track field has an oval running track with parallel curved lane markings surrounding an open central field. Two straight sections connect the rounded ends."
+    },
+    {
+      "name": "harbor",
+      "description": "From above, a harbor is a waterfront complex with docks, piers and sheltered water. Elongated ships may line the berths, with paved storage areas or buildings along the shore."
+    },
+    {
+      "name": "overpass",
+      "description": "From above, an overpass is an elevated roadway crossing another road or railway at a different level. Crossing linear routes, approach ramps and a deck shadow distinguish the junction."
+    },
+    {
+      "name": "ship",
+      "description": "From above, a ship has an elongated hull with a pointed or tapered bow and a wider central deck. It appears in water or beside a dock, sometimes accompanied by a wake."
+    },
+    {
+      "name": "stadium",
+      "description": "From above, a stadium is a large oval, circular or rectangular enclosure around a central playing area. Broad spectator stands or roof sections form a substantial perimeter around the open center."
+    },
+    {
+      "name": "storagetank",
+      "description": "From above, a storage tank usually has a circular roof and a compact cylindrical outline. Similar circles may form regular groups in an industrial site, with curved edges and short side shadows."
+    },
+    {
+      "name": "tenniscourt",
+      "description": "From above, a tennis court is a rectangular playing surface with a central net line, inner service boxes and long parallel side lines. Several equally sized courts may appear side by side."
+    },
+    {
+      "name": "trainstation",
+      "description": "From above, a train station has long narrow platforms beside multiple parallel railway tracks. Elongated platform roofs and larger station buildings accompany the linear rail layout."
+    },
+    {
+      "name": "vehicle",
+      "description": "From above, a vehicle is a small compact rectangular shape with a visible roof and short elongated body. Vehicles may align with road lanes or form rows in parking areas."
+    },
+    {
+      "name": "windmill",
+      "description": "From above, a wind turbine or windmill has a central tower with long blades extending from a hub. A narrow tower shadow and blade shadows may form an angular pattern in open terrain."
+    }
+  ]
+}

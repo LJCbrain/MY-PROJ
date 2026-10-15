@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "description_revision": "v2_appearance_review",
+  "previous_source_sha256": "13522ef87bda8d760eb80c3655d55cd7c710b21e6c7db90b7c61cf2e19f50bfc",
+  "provenance": "Original English descriptions revised by Codex using published appearance-description principles and generic object knowledge, not copied from a paper's description list. Authoring and selection used no DIOR images, annotations, predictions, evaluation scores or prescribed matrix neighbours. This is a rule-reviewed candidate teacher, not a human-expert-certified or empirically validated teacher. Freeze this version before training.",
+  "description_policy": {
+    "viewpoint": "Overhead or high-angle optical aerial imagery; no fixed geographic orientation.",
+    "scope": "Single-object shape for object classes; the internal spatial layout of the full facility for facility classes.",
+    "classname_in_teacher_text": false,
+    "classifier_classnames_unchanged": true,
+    "priority": ["overall silhouette", "visible parts", "internal spatial layout", "conditional fine detail or shadow"],
+    "exclude": ["use or purpose definitions", "fixed colour, absolute size or compass orientation", "mandatory co-occurring objects", "tiny details as required features", "negative comparisons naming other classes", "test-guided text or matrix editing"],
+    "selection": "One coherent, rule-reviewed description per class; no description ensembling or numerical-neighbour optimisation. The same rules apply to Base and Novel classes."
+  },
+  "method_references": [
+    "https://arxiv.org/html/2402.18233v1#S3.SS2",
+    "https://arxiv.org/abs/2210.07183",
+    "https://arxiv.org/abs/2209.03320",
+    "https://arxiv.org/html/2412.11917v2"
+  ],
+  "classes": [
+    {
+      "name": "airplane",
+      "description": "Aerial view: a rigid, bilaterally symmetric body with a long narrow fuselage, two broad side wings and a smaller tailplane. The wings attach near the middle; a distinct nose and tail lie along the main axis."
+    },
+    {
+      "name": "airport",
+      "description": "Aerial view: an extensive paved layout with one or more very long, straight runway strips, narrower connecting taxiways and broad apron pads. Long strips and branching connectors dominate; buildings occupy only part of the complex."
+    },
+    {
+      "name": "baseballfield",
+      "description": "Aerial view: a wedge-shaped sports ground with a compact diamond infield adjoining a broad fan-shaped outfield. Straight foul-line edges open outward from one corner, while a curved outer boundary encloses the contrasting playing surfaces."
+    },
+    {
+      "name": "basketballcourt",
+      "description": "Aerial view: a compact rectangular sports court with a straight outer boundary and symmetric markings. When resolved, a midcourt circle and curved arcs around rectangular key areas at both short ends distinguish the internal layout."
+    },
+    {
+      "name": "bridge",
+      "description": "Aerial view: a long, narrow deck forms a continuous span across water or a visible terrain gap, aligned with its approach paths. The deck has mostly parallel edges; supports or a side shadow may reveal an elevated structure."
+    },
+    {
+      "name": "chimney",
+      "description": "Aerial view: a compact circular or polygonal top caps a tall, narrow shaft with little horizontal spread. A visible rim or dark central opening may occur at the top; a long thin shadow may indicate height."
+    },
+    {
+      "name": "dam",
+      "description": "Aerial view: a broad straight or curved barrier crosses a water channel between two banks. Wide water on one side contrasts with a narrower downstream channel; stepped sections or spillway channels may interrupt the barrier."
+    },
+    {
+      "name": "Expressway-Service-area",
+      "description": "Aerial view: a roadside complex spreads into broad parking areas, short internal drives and several separate buildings beside a through road. Curved access ramps branch from and rejoin the road; a small canopy may cover part of the site."
+    },
+    {
+      "name": "Expressway-toll-station",
+      "description": "Aerial view: a broad transverse canopy or aligned booth row spans a set of tightly parallel road lanes. The carriageway fans outward into many narrow channels at this strip and converges beyond it; repeated islands may separate the channels."
+    },
+    {
+      "name": "golffield",
+      "description": "Aerial view: an irregular landscape of long, winding grass corridors, smaller rounded grass patches and scattered pale sand areas. The corridors connect open patches separated by rougher or wooded surfaces; ponds may interrupt the dispersed layout."
+    },
+    {
+      "name": "groundtrackfield",
+      "description": "Aerial view: a sports enclosure has an oval ring of several parallel running lanes surrounding a large central field. Two straight sides join semicircular ends; the lane band forms a narrow ring around the open playing area."
+    },
+    {
+      "name": "harbor",
+      "description": "Aerial view: a waterfront complex has multiple long piers or quay edges bordering sheltered water, with repeated narrow berths between them. Paved yards and buildings extend inland from the water edge; the outline combines land surfaces and water channels."
+    },
+    {
+      "name": "overpass",
+      "description": "Aerial view: two or more road ribbons cross or overlap at a layered junction, with a continuous upper deck and separate approaches. Branching or looping ramps may connect the routes; offset shadows can indicate their different levels."
+    },
+    {
+      "name": "ship",
+      "description": "Aerial view: a single elongated hull with a tapered or pointed bow, a broader middle and compact structures on the deck. The outline is surrounded by water; a narrow wake or side shadow may be visible."
+    },
+    {
+      "name": "stadium",
+      "description": "Aerial view: a large sports enclosure has a broad oval, circular or rectangular ring of stepped seating or roof segments around a central field. The substantial built perimeter surrounds an open playing area, sometimes with a running track inside."
+    },
+    {
+      "name": "storagetank",
+      "description": "Aerial view: a compact cylindrical structure has a round disk-like roof and a curved outer rim. Roof highlights, concentric seams or a short curved side shadow may be visible; repeated similar disks can form a regular group."
+    },
+    {
+      "name": "tenniscourt",
+      "description": "Aerial view: a rectangular sports court contains an inset playing rectangle, paired service boxes and long parallel sideline markings. When resolved, a straight transverse net line divides the two halves; straight linework forms a symmetric grid within the outer rectangle."
+    },
+    {
+      "name": "trainstation",
+      "description": "Aerial view: several narrow parallel rail lines run beside elongated platforms or platform roofs. The repeated linear strips form a lengthwise arrangement; platforms sit between or alongside the rails, and a larger building may adjoin one edge."
+    },
+    {
+      "name": "vehicle",
+      "description": "Aerial view: a small, compact body with a roughly rectangular roof and short front and rear sections along one main axis. Rounded corners and a thin surrounding shadow may outline the body; the roof occupies much of its top-facing silhouette."
+    },
+    {
+      "name": "windmill",
+      "description": "Aerial view: a slender tower supports a small nacelle and several long, narrow rotor blades radiating from one hub. Blade projections vary with viewing angle; when visible, the tower and rotor cast a thin, branched shadow."
+    }
+  ]
+}
