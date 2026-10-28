@@ -10,6 +10,8 @@ from .mm_backbone import (
     PseudoLanguageBackbone,
     SemanticallyGuardedClassConditionedPrompting)
 from .remoteclip_vit import RemoteCLIPViTL14Backbone
+from .remoteclip_rn50 import RemoteCLIPRN50Backbone
+from .remoteclip_rn50_text import RemoteCLIPRN50LanguageBackbone
 from .mona_backbone import MonaMultiModalYOLOBackbone, MonaYOLOv8CSPDarknet
 
 __all__ = [
@@ -20,6 +22,8 @@ __all__ = [
     'PseudoLanguageBackbone',
     'SemanticallyGuardedClassConditionedPrompting',
     'RemoteCLIPViTL14Backbone',
+    'RemoteCLIPRN50Backbone',
+    'RemoteCLIPRN50LanguageBackbone',
     'MonaMultiModalYOLOBackbone',
     'MonaYOLOv8CSPDarknet',
 ]

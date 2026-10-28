@@ -109,7 +109,8 @@ class SemanticallyGuardedClassConditionedPrompting(nn.Module):
                  normalize_match_by_num_scales: bool = False,
                  collect_key_stats: bool = False,
                  eps: float = 1e-6,
-                 init_std: float = 0.02) -> None:
+                 init_std: float = 0.02,
+                 text_embedding_dim: Optional[int] = None) -> None:
         super().__init__()
         if num_prompts <= 0:
             raise ValueError('num_prompts must be positive.')
@@ -128,7 +129,8 @@ class SemanticallyGuardedClassConditionedPrompting(nn.Module):
         self.num_prompts = int(num_prompts)
         self.prompt_length = int(prompt_length)
         self.num_scales = int(num_scales)
-        self.key_dim = key_dim or text_hidden_size
+        self.text_embedding_dim = text_embedding_dim or text_hidden_size
+        self.key_dim = key_dim or self.text_embedding_dim
         self.use_reliability = bool(use_reliability)
         self.use_reliability_prior = bool(use_reliability_prior)
         if use_reliable_global_pool is None:
@@ -167,11 +169,10 @@ class SemanticallyGuardedClassConditionedPrompting(nn.Module):
             normalize_match_by_num_scales)
         self.collect_key_stats = bool(collect_key_stats)
         self.eps = float(eps)
-        if (self.class_semantic_residual_weight > 0 and
-                self.key_dim != text_hidden_size):
+        if self.key_dim != self.text_embedding_dim:
             raise ValueError(
-                'class semantic residual requires key_dim to equal '
-                'text_hidden_size.')
+                'Prompt routing requires key_dim to equal text_embedding_dim; '
+                'prompt token text_hidden_size may differ.')
 
         if feat_indices is None:
             feat_indices = tuple(range(num_scales))
@@ -244,6 +245,9 @@ class SemanticallyGuardedClassConditionedPrompting(nn.Module):
         if class_embeddings.dim() != 3:
             raise ValueError(
                 'class_embeddings must have shape [B, N, D].')
+        if class_embeddings.shape[-1] != self.text_embedding_dim:
+            raise ValueError(
+                'class_embeddings must match the prompt routing embedding dimension.')
         batch_size, num_classes = class_embeddings.shape[:2]
         if text_mask is None:
             text_mask = torch.ones(
@@ -768,6 +772,15 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         clip_config = CLIPTextConfig.from_pretrained(model_name,
                                                      attention_dropout=dropout)
         self.model = CLIPTP.from_pretrained(model_name, config=clip_config)
+        self._init_prompt_bank(prompt_bank_cfg, clip_config.hidden_size,
+                               clip_config.projection_dim)
+        self._freeze_modules()
+
+    def _init_prompt_bank(self, prompt_bank_cfg, text_hidden_size,
+                          text_embedding_dim):
+        """Keep token width separate from the projected class/routing space."""
+        self.text_hidden_size = int(text_hidden_size)
+        self.text_embedding_dim = int(text_embedding_dim)
         self.prompt_bank = None
         self._prompt_bank_losses = {}
         self._last_base_text_features = None
@@ -809,15 +822,32 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                     raise ValueError(
                         'text_topology_temperature must be positive.')
                 prompt_bank_cfg.setdefault('text_hidden_size',
-                                           clip_config.hidden_size)
+                                           self.text_hidden_size)
+                prompt_bank_cfg.setdefault('text_embedding_dim',
+                                           self.text_embedding_dim)
+                if (prompt_bank_cfg['text_hidden_size'] != self.text_hidden_size or
+                        prompt_bank_cfg['text_embedding_dim'] != self.text_embedding_dim):
+                    raise ValueError('Prompt dimensions must match the text encoder.')
                 self.prompt_bank = MultiScalePromptBank(**prompt_bank_cfg)
-        self._freeze_modules()
+
+    @property
+    def text_device(self):
+        return next(self.model.parameters()).device
+
+    def _token_embedding(self):
+        return self.model.text_model.embeddings.token_embedding
+
+    def _max_text_positions(self):
+        return self.model.config.max_position_embeddings
+
+    def _encode_text(self, text_inputs):
+        return self.model(**text_inputs).text_embeds
 
     def forward_tokenizer(self, texts):
         if not hasattr(self, 'text'):
             text = list(itertools.chain(*texts))#列表扁平化
             text = self.tokenizer(text=text, return_tensors='pt', padding=True)
-            self.text = text.to(device=self.model.device)
+            self.text = text.to(device=self.text_device)
         return self.text
 
     @property
@@ -838,19 +868,18 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         flat_texts = list(itertools.chain(*text))
         valid_text_mask = torch.tensor(
             [x != self.pad_value for x in flat_texts],
-            device=self.model.device,
+            device=self.text_device,
             dtype=torch.bool).reshape(batch_size, num_classes)
         text_inputs = self.tokenizer(
             text=flat_texts, return_tensors='pt', padding=True)
-        text_inputs = text_inputs.to(device=self.model.device)
+        text_inputs = text_inputs.to(device=self.text_device)
 
         self._prompt_bank_losses = {}
         self._last_base_text_features = None
         if self.has_prompt_bank and image_features is not None:
             if base_text_features is None:
                 with torch.no_grad():
-                    base_outputs = self.model(**text_inputs)
-                    base_text_features = base_outputs.text_embeds
+                    base_text_features = self._encode_text(text_inputs)
                 base_text_features = F.normalize(
                     base_text_features, dim=-1).reshape(
                         batch_size, num_classes, -1)
@@ -876,11 +905,9 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                 image_features, reliability_maps)
         elif len(self.frozen_modules) > 0:
             with torch.no_grad():
-                txt_outputs = self.model(**text_inputs)
-                txt_feats = txt_outputs.text_embeds
+                txt_feats = self._encode_text(text_inputs)
         else:
-            txt_outputs = self.model(**text_inputs)
-            txt_feats = txt_outputs.text_embeds
+            txt_feats = self._encode_text(text_inputs)
 
         if txt_feats.dim() == 2:
             txt_feats = F.normalize(txt_feats, dim=-1).reshape(
@@ -904,7 +931,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        token_embedding = self.model.text_model.embeddings.token_embedding
+        token_embedding = self._token_embedding()
         token_embeds = token_embedding(input_ids)
         prompt_tokens = prompt_tokens.to(
             device=token_embeds.device, dtype=token_embeds.dtype)
@@ -914,8 +941,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
             raise ValueError(
                 'prompt_tokens must have shape [B, P, D] or [B, N, P, D].')
         prompt_len = prompt_tokens.shape[-2]
-        max_positions = getattr(self.model.config, 'max_position_embeddings',
-                                input_ids.shape[1] + prompt_len)
+        max_positions = self._max_text_positions()
         valid_lens = attention_mask.sum(dim=-1).long()
         max_valid_len = int(valid_lens.max().item())
         max_seq_len = min(max_positions, prompt_len + max_valid_len)
@@ -1008,7 +1034,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         anchor_texts = anchor_texts_once * batch_size
         anchor_inputs = self.tokenizer(
             text=anchor_texts, return_tensors='pt', padding=True)
-        anchor_inputs = anchor_inputs.to(device=self.model.device)
+        anchor_inputs = anchor_inputs.to(device=self.text_device)
         prompted_embeddings = self._forward_prompted_text(
             anchor_inputs, prompt_tokens, anchor_count)
         prompted_embeddings = F.normalize(prompted_embeddings, dim=-1)
@@ -1053,14 +1079,16 @@ class HuggingCLIPLanguageBackbone(BaseModule):
             anchor_inputs = self.tokenizer(
                 text=list(self.semantic_anchor_texts),
                 return_tensors='pt', padding=True)
-            anchor_inputs = anchor_inputs.to(device=self.model.device)
+            anchor_inputs = anchor_inputs.to(device=self.text_device)
             with torch.no_grad():
-                embeddings = self.model(**anchor_inputs).text_embeds
+                embeddings = self._encode_text(anchor_inputs)
 
         if not torch.is_tensor(embeddings):
             raise TypeError('semantic anchor table must contain a tensor.')
         if embeddings.shape[0] != len(self.semantic_anchor_texts):
             raise ValueError('semantic anchor table has an unexpected class count.')
+        if embeddings.ndim != 2 or embeddings.shape[1] != self.text_embedding_dim:
+            raise ValueError('semantic anchor table has an unexpected embedding dimension.')
         self._semantic_anchor_embeddings = F.normalize(
             embeddings.detach().float(), dim=-1)
         return self._semantic_anchor_embeddings
@@ -1155,6 +1183,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
     def train(self, mode=True):
         super().train(mode)
         self._freeze_modules()
+        return self
 
 
 @MODELS.register_module()
@@ -1223,6 +1252,11 @@ class MultiModalYOLOBackbone(BaseModule):
             self.text_model = MODELS.build(text_model)
         else:
             self.text_model = None
+        if (getattr(self.image_model, 'remoteclip_arch', None) == 'RN50' and
+                getattr(self.text_model, 'remoteclip_arch', None) == 'RN50' and
+                os.path.realpath(self.image_model.checkpoint) !=
+                os.path.realpath(self.text_model.checkpoint)):
+            raise ValueError('RemoteCLIP RN50 towers must use the same checkpoint.')
         self.frozen_stages = frozen_stages
         self._freeze_stages()
 

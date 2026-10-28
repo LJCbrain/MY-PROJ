@@ -36,6 +36,8 @@ class OVCIterationParamSchedulerHook(YOLOv5ParamSchedulerHook):
 
 @HOOKS.register_module()
 class OVCIterationPipelineSwitchHook(Hook):
+    """Switch a single dataset or every child of a concatenated dataset."""
+
     priority = 48
 
     def __init__(self, switch_iter, switch_pipeline):
@@ -47,7 +49,14 @@ class OVCIterationPipelineSwitchHook(Hook):
         if self._switched:
             return
         loader = runner.train_dataloader
-        loader.dataset.pipeline = Compose(deepcopy(self.switch_pipeline))
+        datasets = getattr(loader.dataset, 'datasets', [loader.dataset])
+        if not datasets or any(not hasattr(dataset, 'pipeline')
+                               for dataset in datasets):
+            raise TypeError(
+                'OVCIterationPipelineSwitchHook requires every training '
+                'dataset to expose a pipeline.')
+        for dataset in datasets:
+            dataset.pipeline = Compose(deepcopy(self.switch_pipeline))
         # Drop prefetched Mosaic batches and rebuild worker copies of the dataset.
         wrapper = runner.train_loop.dataloader_iterator
         iterator = wrapper._iterator
@@ -57,7 +66,9 @@ class OVCIterationPipelineSwitchHook(Hook):
             loader._iterator = None
         wrapper._iterator = iter(loader)
         self._switched = True
-        runner.logger.info('OVC: clean-image pipeline enabled at completed step %d.', self.switch_iter)
+        runner.logger.info(
+            'OVC: clean-image pipeline enabled for %d dataset(s) at completed '
+            'step %d.', len(datasets), self.switch_iter)
 
     def before_train(self, runner):
         if runner.iter >= self.switch_iter:

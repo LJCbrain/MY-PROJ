@@ -74,6 +74,17 @@ def load_remoteclip(path, tokenizer):
         source = source['state_dict']
     if all(key.startswith('module.') for key in source):
         source = {key[7:]: value for key, value in source.items()}
+    return build_openclip_vit_l14(source, tokenizer, hidden_act='gelu')
+
+
+def build_openclip_vit_l14(source, tokenizer, hidden_act):
+    """Strict conversion of a paired OpenCLIP ViT-L/14 state (224px).
+
+    Activation is part of the checkpoint recipe: RemoteCLIP uses GELU;
+    SkyCLIP uses QuickGELU. No detector weights are changed here.
+    """
+    if hidden_act not in ('gelu', 'quick_gelu'):
+        raise ValueError('Unsupported OpenCLIP activation.')
     state = convert_text_state_dict(source)
     vision = {key[7:]: value for key, value in source.items()
               if key.startswith('visual.')}
@@ -97,7 +108,7 @@ def load_remoteclip(path, tokenizer):
         for suffix in ('weight', 'bias'):
             qkv = vision.pop(old + 'attn.in_proj_' + suffix)
             if qkv.shape[0] != 3072:
-                raise ValueError('Expected RemoteCLIP ViT-L/14 QKV width 3072.')
+                raise ValueError('Expected OpenCLIP ViT-L/14 QKV width 3072.')
             for name, tensor in zip(('q', 'k', 'v'), qkv.chunk(3, dim=0)):
                 state['vision_model.' + new + f'self_attn.{name}_proj.{suffix}'] = tensor.contiguous()
             for src, dst in (
@@ -113,14 +124,15 @@ def load_remoteclip(path, tokenizer):
         text_config=dict(
             vocab_size=49408, hidden_size=768, intermediate_size=3072,
             num_hidden_layers=12, num_attention_heads=12,
-            max_position_embeddings=77, hidden_act='gelu',
+            max_position_embeddings=77, hidden_act=hidden_act,
             bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id),
         vision_config=dict(
             hidden_size=1024, intermediate_size=4096, num_hidden_layers=24,
             num_attention_heads=16, image_size=224, patch_size=14,
-            hidden_act='gelu'))
+            hidden_act=hidden_act))
+    config._attn_implementation = 'eager'
     model = CLIPModel(config)
     model.load_state_dict(state, strict=True)
     return model

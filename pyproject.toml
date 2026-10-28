@@ -46,6 +46,9 @@ dependencies = [
 
 ]
 
+[project.optional-dependencies]
+remoteclip-rn50 = ["open_clip_torch==2.24.0"]
+
 [tool.setuptools]
 package-dir = {"yolo_world" = "yolo_world"}
 include-package-data = false

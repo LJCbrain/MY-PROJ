@@ -1,5 +1,7 @@
 """Single detector, shared two-view Adapter, no teacher or semantic holdout."""
 
+import time
+
 import torch
 from mmyolo.registry import MODELS
 
@@ -108,10 +110,41 @@ class YOLOWorldOVCDetector(YOLOWorldDetector):
 @MODELS.register_module()
 class YOLOWorldOVCPartialDetector(YOLOWorldOVCDetector):
     """Attach O-ranked, class-agnostic proposals without a second image pass."""
+    def __init__(self, *args, clip_roi_cfg=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        from ..layers.clip_roi import clip_roi_config
+        self.clip_roi_cfg = clip_roi_config(clip_roi_cfg)
+        self._clip_roi_runtime = None
+        self.last_clip_roi_timings = []
+        self.last_clip_roi_debug = None
+
+    def _apply(self, fn, *args, **kwargs):
+        # Runtime-only CLIP weights/caches must not stay on an obsolete device.
+        self._clip_roi_runtime = None
+        return super()._apply(fn, *args, **kwargs)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        self._clip_roi_runtime = None
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
+
     def predict(self, batch_inputs, batch_data_samples, rescale=True):
+        enabled = self.clip_roi_cfg['enabled']
+        if enabled:
+            if not rescale:
+                raise ValueError('CLIP RoI requires rescale=True (original-image boxes).')
+            from ..layers.clip_roi import FrozenCLIPRegionScorer, sync
+            sync(batch_inputs.device)
+            start = time.perf_counter()
         capture = {}
+        def capture_dense(module, args, output):
+            capture['boxes'] = output[1]
+            if enabled:
+                capture['classes'] = output[0]
         handle = self.bbox_head.register_forward_hook(
-            lambda module, args, output: capture.update(boxes=output[1]))
+            capture_dense)
         try:
             results = super().predict(batch_inputs, batch_data_samples, rescale=rescale)
         finally:
@@ -123,4 +156,29 @@ class YOLOWorldOVCPartialDetector(YOLOWorldOVCDetector):
             [sample.metainfo for sample in results], rescale=rescale)
         for sample, proposal in zip(results, proposals):
             sample.proposal_instances = proposal
+        if enabled:
+            sync(batch_inputs.device)
+            detector_s = time.perf_counter() - start
+            if self._clip_roi_runtime is None:
+                self._clip_roi_runtime = FrozenCLIPRegionScorer(self.clip_roi_cfg)
+            runtime = self._clip_roi_runtime
+            self.last_clip_roi_timings = []
+            self.last_clip_roi_debug = [] if self.clip_roi_cfg['debug'] else None
+            for index, sample in enumerate(results):
+                prediction, timing = runtime.predict(
+                    self.bbox_head,
+                    [x[index:index+1] for x in capture['classes']],
+                    [x[index:index+1] for x in boxes],
+                    objectness[index:index+1], sample.metainfo, batch_inputs.device)
+                sample.pred_instances = prediction
+                self.last_clip_roi_timings.append(timing)
+                if self.last_clip_roi_debug is not None:
+                    self.last_clip_roi_debug.append(runtime.last_debug)
+            sync(batch_inputs.device)
+            predict_s = time.perf_counter() - start
+            for sample, timing in zip(results, self.last_clip_roi_timings):
+                timing.update(detector_batch_s=detector_s, predict_batch_s=predict_s)
+                # DumpResults preserves these measurements; batch times include
+                # all images and exclude the runner's data loading/preprocessor.
+                sample.set_metainfo(dict(clip_roi_timing=timing))
         return results

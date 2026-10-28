@@ -5,13 +5,16 @@ COCOeval. Per-image caches permit interruption and resume with identical setting
 """
 import argparse
 import contextlib
+import csv
 import hashlib
 import inspect
 import io
 import json
 import os
+import platform
 from pathlib import Path
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -20,11 +23,27 @@ import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+# Share candidate selection/fusion/NMS with the detector without importing its registry.
+import importlib.util
+_roi_spec = importlib.util.spec_from_file_location(
+    '_yolo_world_clip_roi_infer', ROOT / 'yolo_world/models/layers/clip_roi.py')
+_roi = importlib.util.module_from_spec(_roi_spec)
+_roi_spec.loader.exec_module(_roi)
+nms_indices = _roi.nms_indices
+candidate_indices = _roi.candidate_indices
+candidate_subset = _roi.candidate_subset
+geometric_fusion = _roi.geometric_fusion
+postprocess = _roi.postprocess
+
 CLASSES = ('airplane', 'airport', 'baseballfield', 'basketballcourt', 'bridge',
            'chimney', 'dam', 'Expressway-Service-area', 'Expressway-toll-station',
            'golffield', 'groundtrackfield', 'harbor', 'overpass', 'ship', 'stadium',
            'storagetank', 'tenniscourt', 'trainstation', 'vehicle', 'windmill')
 NOVEL_IDS = (1, 3, 10, 19)
+# User-frozen deployment protocol, 2026-10-23. Historical sweeps require
+# explicit CLI overrides; new experiments use this single setting.
+FIXED_FUSION = dict(ranking='yolo_max', k=100, multiplier='none', novel_lambda=.85)
+FUSION_MODELS = ('clip', 'remoteclip', 'clip_roi', 'skyclip_roi', 'remoteclip_roi', 'rn50_roi', 'remoteclip_rn50_roi')
 
 
 def log(message):
@@ -66,22 +85,8 @@ def load_json(path):
     return json.loads(Path(path).read_text(encoding='utf-8'))
 
 
-def nms_indices(boxes, scores, topk, limit, threshold):
-    from mmcv.ops import nms
-    if len(boxes) == 0:
-        return torch.empty(0, dtype=torch.long, device=boxes.device)
-    order = scores.argsort(descending=True)[:topk]
-    _, keep = nms(boxes[order].contiguous(), scores[order].contiguous(), threshold)
-    return order[keep[:limit]]
 
 
-def candidate_indices(boxes, scores, objectness, o_limit=300, semantic_limit=100):
-    valid = torch.isfinite(boxes).all(1) & ((boxes[:, 2:] - boxes[:, :2]) > 0).all(1)
-    indices = torch.where(valid)[0]
-    b = boxes[indices]
-    first = nms_indices(b, objectness[indices], 3000, o_limit, .7)
-    second = nms_indices(b, scores[indices].max(1).values, 3000, semantic_limit, .7)
-    return indices[torch.unique(torch.cat((first, second)), sorted=True)]
 
 
 def read_manifest(cache):
@@ -111,7 +116,7 @@ def extract(args):
     state = torch.load(str(checkpoint), **options)
     cfg = Config.fromstring(state['meta']['cfg'], '.py')
     if cfg.model.type != 'YOLOWorldOVCPartialDetector':
-        raise ValueError('Use the original DIOR 2.17 checkpoint, not a distillation model.')
+        raise ValueError('Expected a YOLOWorldOVCPartialDetector checkpoint (e.g. DIOR 2.17 or 3.12).')
     text_cfg = cfg.model.backbone.get('text_model', {})
     if ('semantic_fusion_cfg' in text_cfg
             and not text_cfg['semantic_fusion_cfg'].get('enabled', False)):
@@ -280,29 +285,24 @@ def score(args):
     log('Scores cached. This step does not select labels or use GT.')
 
 
-def score_matrix(data, cosine=None, logit_scale=1.0):
+def score_matrix(data, cosine=None, logit_scale=1.0, multiplier='objectness'):
     if cosine is None:
         return torch.from_numpy(data['yolo_scores']).float()
     # All 20 classes compete. These are initial scores, not calibrated
     # foreground probabilities. Keep raw cosine values for later experiments.
     values = torch.from_numpy(cosine).float()
-    return (values * logit_scale).softmax(-1) * torch.from_numpy(data['objectness']).float()[:, None]
+    scores = (values * logit_scale).softmax(-1)
+    if multiplier == 'objectness':
+        scores *= torch.from_numpy(data['objectness']).float()[:, None]
+    elif multiplier == 'yolo_max':
+        scores *= torch.from_numpy(data['yolo_scores']).float().max(-1).values[:, None]
+    elif multiplier != 'none':
+        raise ValueError('Unknown VLM multiplier: ' + multiplier)
+    return scores
 
 
-def postprocess(boxes, scores, labels, manifest):
-    from mmcv.ops import batched_nms
-    keep = (scores > manifest['score_thr']) & torch.isfinite(scores)
-    boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
-    if not len(scores):
-        return boxes, scores, labels
-    order = scores.argsort(descending=True)
-    if manifest['nms_pre'] > 0:
-        order = order[:manifest['nms_pre']]
-    boxes, scores, labels = boxes[order], scores[order], labels[order]
-    _, keep = batched_nms(boxes.contiguous(), scores.contiguous(), labels,
-                         dict(type='nms', iou_threshold=manifest['nms_iou']), class_agnostic=False)
-    keep = keep[:manifest['max_per_img']]
-    return boxes[keep], scores[keep], labels[keep]
+
+
 
 
 def predictions(data, matrix, manifest, split=False, scale=1.0):
@@ -405,6 +405,403 @@ def evaluate_cache(cache, models, scales):
     return summaries
 
 
+
+
+def two_folds(image_ids, seed):
+    if len(image_ids) < 2 or len(set(image_ids)) != len(image_ids):
+        raise ValueError('Two folds require at least two unique images.')
+    shuffled = np.random.RandomState(seed).permutation(sorted(image_ids)).tolist()
+    return [sorted(shuffled[::2]), sorted(shuffled[1::2])]
+
+
+def ap_summary(per_class):
+    base = float(np.mean([per_class[c] for i, c in enumerate(CLASSES) if i not in NOVEL_IDS]))
+    novel = float(np.mean([per_class[CLASSES[i]] for i in NOVEL_IDS]))
+    return dict(base_ap50=base, novel_ap50=novel,
+                hm=2*base*novel/(base+novel) if base+novel else 0., per_class_ap50=per_class)
+
+
+def select_twofold(rows, summaries):
+    """Choose only on the training fold; ties favor smaller external weight."""
+    groups = {}
+    controls = {}
+    for row in rows:
+        key = (row['ranking'], row['requested_k'])
+        if row['model'] == 'yolo':
+            controls[key] = row
+        else:
+            groups.setdefault((row['model'], row['multiplier']) + key, []).append(row)
+    selections = []
+    # Per-setting ablations plus a fully nested selection across the whole grid.
+    jobs = [(str(key), group + [controls[key[2:]]]) for key, group in groups.items()]
+    jobs.append(('all_settings_selected_on_training_fold', rows))
+    for group_name, group in jobs:
+        for train_fold in (0, 1):
+            test_fold = 1 - train_fold
+            chosen = min(group, key=lambda r: (
+                -summaries[r['variant']]['folds'][train_fold]['novel_ap50'],
+                r['novel_lambda'], r['variant']))
+            control = controls[(chosen['ranking'], chosen['requested_k'])]
+            train = summaries[chosen['variant']]['folds'][train_fold]
+            heldout = summaries[chosen['variant']]['folds'][test_fold]
+            baseline = summaries[control['variant']]['folds'][test_fold]
+            record = dict(group=group_name, train_fold=train_fold, heldout_fold=test_fold,
+                          selected_variant=chosen['variant'], selected_lambda=chosen['novel_lambda'],
+                          model=chosen['model'], multiplier=chosen['multiplier'],
+                          ranking=chosen['ranking'], requested_k=chosen['requested_k'],
+                          train_Novel_AP50=100*train['novel_ap50'],
+                          Novel_AP50=100*heldout['novel_ap50'], Base_AP50=100*heldout['base_ap50'],
+                          HM=100*heldout['hm'], control_Novel_AP50=100*baseline['novel_ap50'],
+                          delta_vs_control_pp=100*(heldout['novel_ap50']-baseline['novel_ap50']))
+            record.update({c: 100*heldout['per_class_ap50'][c] for c in CLASSES})
+            record['mean_actual_k'] = chosen.get('mean_actual_k', chosen['requested_k'])
+            record['cached_processing_ms_per_image'] = chosen.get('selection_fusion_nms_ms_per_image', 0.)
+            selections.append(record)
+    means = []
+    for group_name, _ in jobs:
+        pair = [r for r in selections if r['group'] == group_name]
+        mean = dict(group=group_name, metric='unweighted mean of two held-out fold APs; not pooled AP')
+        family = next((key for key in groups if str(key) == group_name), None)
+        mean.update(model=family[0] if family else 'joint_selection',
+                    multiplier=family[1] if family else 'selected',
+                    ranking=family[2] if family else 'selected',
+                    requested_k=family[3] if family else None)
+        for key in ('Novel_AP50', 'Base_AP50', 'HM', 'control_Novel_AP50', 'delta_vs_control_pp',
+                    'mean_actual_k', 'cached_processing_ms_per_image') + CLASSES:
+            mean[key] = float(np.mean([r[key] for r in pair]))
+        mean['both_folds_improve_and_airport_windmill_positive'] = all(
+            r['delta_vs_control_pp'] > 0 and r['airport'] > 0 and r['windmill'] > 0 for r in pair)
+        means.append(mean)
+    return dict(selections=selections, means=means)
+
+
+def write_csv(path, rows):
+    with Path(path).open('w', newline='', encoding='utf-8-sig') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_k_curves(out, means):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log('Matplotlib unavailable; K curve data are in twofold_means.csv.')
+        return
+    for model in sorted({r['model'] for r in means} - {'joint_selection'}):
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        groups = sorted({(r['multiplier'], r['ranking']) for r in means if r['model'] == model})
+        for multiplier, ranking in groups:
+            points = sorted((r for r in means if r['model'] == model and r['multiplier'] == multiplier
+                             and r['ranking'] == ranking and r['requested_k'] is not None),
+                            key=lambda r: r['requested_k'])
+            if not points:
+                continue
+            for ax, metric in zip(axes, ['Novel_AP50', 'cached_processing_ms_per_image']):
+                ax.plot([r['requested_k'] for r in points], [r[metric] for r in points],
+                        marker='o', label=multiplier + ' / ' + ranking)
+                ax.set_xlabel('Requested K (limited by cached candidate count)')
+                ax.grid(alpha=.25)
+        axes[0].set_ylabel('Mean held-out Novel AP50 (%)')
+        axes[1].set_ylabel('Cached selection + fusion + NMS (ms/image)')
+        axes[0].legend(fontsize=7)
+        fig.suptitle(model + ': two-fold lambda selection; encoder forward time excluded')
+        fig.tight_layout()
+        fig.savefig(out / ('k_curve_' + model + '.png'), dpi=160)
+        plt.close(fig)
+
+
+def evaluate_fusion_cache(cache, models, lambdas, multipliers, output_dir=None,
+                          ann_file=None, reference_novel=8.39, allow_partial=False,
+                          cross_validate=False, candidate_ks=None, rankings=None, fold_seed=0,
+                          max_per_img=1000):
+    """No forwards: D_B postprocessing on the *retained* candidate universe.
+
+    Original post-NMS predictions cannot reproduce dense D_B. Never merge them
+    into this control: all variants use identical cached boxes for all classes.
+    Predictions are spooled one variant at a time and evaluated one class at a
+    time, bounding RAM independently of the number of sweep combinations.
+    """
+    from pycocotools.coco import COCO
+    from tools.val.eval_dior_candidate_protection import evaluate_category
+
+    started = time.perf_counter()
+    if isinstance(max_per_img, bool) or not isinstance(max_per_img, int) or max_per_img < 1:
+        raise ValueError('max_per_img must be a positive integer; AP remains eval@100.')
+    cache = Path(cache).resolve()
+    candidate_ks = list(dict.fromkeys(candidate_ks or [None]))
+    rankings = list(dict.fromkeys(rankings or ['objectness']))
+    if any(k is not None and (not isinstance(k, int) or k < 1) for k in candidate_ks):
+        raise ValueError('Candidate K must be a positive integer.')
+    if any(r not in ('objectness', 'yolo_max') for r in rankings):
+        raise ValueError('Invalid candidate ranking.')
+    models = list(dict.fromkeys(models))
+    lambdas = list(dict.fromkeys(lambdas))
+    multipliers = list(dict.fromkeys(multipliers))
+    if not models or any(m not in FUSION_MODELS for m in models):
+        raise ValueError('Select supported cached VLM scores.')
+    if not lambdas or any(not np.isfinite(x) or not 0 <= x <= 1 for x in lambdas):
+        raise ValueError('Novel lambdas must be finite and in [0, 1].')
+    if not multipliers or any(m not in ('objectness', 'yolo_max', 'none') for m in multipliers):
+        raise ValueError('Unknown VLM multiplier.')
+    if not np.isfinite(reference_novel) or not 0 <= reference_novel <= 100:
+        raise ValueError('Reference Novel AP50 must be a percentage in [0, 100].')
+    manifest = read_manifest(cache)
+    extraction = manifest['protocol']
+    if extraction.get('classes') != list(CLASSES) or extraction.get('selection_uses_gt') is not False:
+        raise ValueError('Cache must declare DIOR class order and GT-free candidate selection.')
+    annotation = Path(ann_file or manifest['ann_file']).resolve()
+    if digest(annotation) != extraction['annotation_sha256']:
+        raise ValueError('Annotation file changed since extraction.')
+    with contextlib.redirect_stdout(io.StringIO()):
+        gt = COCO(str(annotation))
+    name_ids = {c['name']: c['id'] for c in gt.cats.values()}
+    if len(gt.cats) != len(CLASSES) or set(name_ids) != set(CLASSES):
+        raise ValueError('Annotation class names differ.')
+    image_ids = [entry['id'] for entry in manifest['images']]
+    if len(set(image_ids)) != len(image_ids) or not set(image_ids).issubset(gt.imgs):
+        raise ValueError('Duplicate or unknown image IDs in cache.')
+    complete = set(image_ids) == set(gt.imgs)
+    if not complete and not allow_partial:
+        raise ValueError('Incomplete split cache; use --allow-partial for smoke tests only.')
+    folds = two_folds(image_ids, fold_seed) if cross_validate else []
+    fold_counts = []
+    for ids in folds:
+        id_set = set(ids)
+        counts = {c: sum(1 for a in gt.anns.values() if a['image_id'] in id_set
+                        and a['category_id'] == name_ids[c] and not a.get('iscrowd', 0)) for c in CLASSES}
+        if any(counts[CLASSES[i]] == 0 for i in NOVEL_IDS):
+            raise ValueError('A fold lacks Novel ground truth; use a larger cache. Do not tune seeds on AP.')
+        fold_counts.append(counts)
+    model_meta = {}
+    for name in models:
+        provenance = load_json(cache / name / 'protocol.json')
+        if provenance.get('extraction') != extraction or provenance.get('model') != name:
+            raise ValueError('VLM extraction protocol mismatch: ' + name)
+        info = load_json(cache / name / 'model_info.json')
+        scale = info['logit_scale']
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError('Invalid VLM logit scale: ' + name)
+        model_meta[name] = dict(protocol=provenance, model_info=info)
+
+    log('Checking complete candidate/cosine caches; no models will be loaded.')
+    # Hash all input arrays once, and retain a compact identity of this run.
+    cache_identity = hashlib.sha256()
+    for entry in manifest['images']:
+        source = cache / 'candidates' / '{}.npz'.format(entry['id'])
+        source_hash = digest(source)
+        cache_identity.update((str(entry['id']) + source_hash).encode())
+        with np.load(source) as data:
+            boxes, yolo, objects = data['boxes'], data['yolo_scores'], data['objectness']
+            n = len(boxes)
+            if (boxes.shape != (n, 4) or yolo.shape != (n, len(CLASSES))
+                    or objects.shape != (n,) or not np.isfinite(boxes).all()
+                    or not (boxes[:, 2:] > boxes[:, :2]).all()):
+                raise ValueError('Invalid candidate shapes/boxes: ' + str(source))
+            if any(not np.isfinite(a).all() or ((a < 0) | (a > 1)).any()
+                   for a in (yolo, objects)):
+                raise ValueError('Candidate probabilities must be finite in [0, 1].')
+            for name in models:
+                scored_path = cache / name / source.name
+                with np.load(scored_path) as scored:
+                    if str(scored['candidate_sha256']) != source_hash:
+                        raise ValueError('Candidate/score cache mismatch: ' + str(scored_path))
+                    if scored['cosine'].shape != yolo.shape or not np.isfinite(scored['cosine']).all():
+                        raise ValueError('Invalid cosine matrix: ' + str(scored_path))
+                cache_identity.update((name + digest(scored_path)).encode())
+
+    out = Path(output_dir) if output_dir else cache / (
+        'fusion_D_B_eval100_' + time.strftime('%Y%m%d_%H%M%S') + '_' + str(os.getpid()))
+    out = out.resolve()
+    if out.exists() and any(out.iterdir()):
+        raise FileExistsError('Use a new or empty output directory: ' + str(out))
+    out.mkdir(parents=True, exist_ok=True)
+    settings = dict(score_thr=1e-4, nms_pre=2_147_483_647, nms_iou=.7, max_per_img=max_per_img)
+    # Import/initialize CPU NMS before timing any of the configurations.
+    postprocess(torch.tensor([[0., 0., 1., 1.]]), torch.ones(1), torch.zeros(1, dtype=torch.long), settings)
+    protocol = dict(
+        version=2, experiment='cached_candidate_fusion', cache_dir=str(cache),
+        cache_sha256=cache_identity.hexdigest(), extraction=extraction, models=model_meta,
+        ann_file=str(annotation), image_ids=image_ids, full_split=complete,
+        postprocessing='D_B', settings=settings, eval_max_dets=[1, 10, 100],
+        candidate_scope='retained O/semantic union; not the full dense D_B candidate set',
+        formula='Novel: YOLO**(1-lambda) * (softmax(logit_scale*cosine)*multiplier)**lambda',
+        base_scores='unmodified YOLO on the same cached candidates',
+        lambdas=lambdas, multipliers=multipliers,
+        reference_novel_ap50_percent=reference_novel,
+        reference_verified=False, selection_uses_gt=False,
+        evaluation_uses_gt=True, tuning_on_evaluation_split=not cross_validate,
+        cross_validate=cross_validate, fold_seed=fold_seed, folds=folds,
+        fold_class_counts=fold_counts, fold_method='sorted image IDs, seeded shuffle, alternating halves',
+        split_limit='image-disjoint only; geographic/source-scene independence is not established',
+        candidate_ks=candidate_ks, rankings=rankings,
+        timing_scope='CPU cached replay and COCO evaluation; excludes detector/crop encoder forward',
+        timing_environment=dict(platform=platform.platform(), cpu=platform.processor(),
+                                torch_version=torch.__version__, cpu_threads=torch.get_num_threads()),
+        preflight_seconds=time.perf_counter()-started)
+    write_json(out / 'protocol.json', protocol)
+    variants = []
+    for ranking in rankings:
+        for k in candidate_ks:
+            prefix = '' if candidate_ks == [None] and len(rankings) == 1 else '{}_K{}_'.format(ranking, k or 'all')
+            variants.append((prefix + 'yolo_candidates', None, 'none', 0., ranking, k, prefix))
+            variants += [(prefix + '{}_{}_lambda{}'.format(m, mult, repr(float(lam))),
+                          m, mult, lam, ranking, k, prefix)
+                         for m in models for mult in multipliers for lam in lambdas if lam != 0]
+    summaries, rows = {}, []
+    log('Planned {} variants; max_per_img={}; timing includes no encoder forward.'.format(
+        len(variants), max_per_img))
+    for variant, name, multiplier, lam, ranking, k, prefix in variants:
+        log('Evaluating ' + variant)
+        count = 0
+        actual_ks = []
+        timing = dict(cache_read_s=0., selection_fusion_nms_s=0., prediction_write_s=0., coco_eval_s=0.)
+        variant_started = time.perf_counter()
+        # Temporary prediction files are removed after each variant's metrics.
+        with tempfile.TemporaryDirectory(prefix='predictions_', dir=out) as temp:
+            temp = Path(temp)
+            with contextlib.ExitStack() as stack:
+                writers = {c: stack.enter_context((temp / (str(name_ids[c]) + '.jsonl')).open(
+                    'w', encoding='utf-8')) for c in CLASSES}
+                for index, entry in enumerate(manifest['images']):
+                    tick = time.perf_counter()
+                    source = cache / 'candidates' / '{}.npz'.format(entry['id'])
+                    with np.load(source) as arrays:
+                        data = {key: arrays[key] for key in ('boxes', 'yolo_scores', 'objectness')}
+                    cosine = None
+                    if name is not None:
+                        with np.load(cache / name / source.name) as scored:
+                            cosine = scored['cosine']
+                    timing['cache_read_s'] += time.perf_counter()-tick
+                    tick = time.perf_counter()
+                    keep = candidate_subset(data, ranking, k)
+                    actual_ks.append(len(keep))
+                    data = {key: value[keep] for key, value in data.items()}
+                    matrix = score_matrix(data)
+                    if name is not None:
+                        vlm = score_matrix(data, cosine[keep],
+                                           model_meta[name]['model_info']['logit_scale'], multiplier)
+                        matrix = geometric_fusion(matrix, vlm, lam)
+                    boxes, scores, labels = (v.numpy() for v in predictions(data, matrix, settings))
+                    timing['selection_fusion_nms_s'] += time.perf_counter()-tick
+                    tick = time.perf_counter()
+                    count += len(scores)
+                    boxes = boxes.copy()
+                    boxes[:, 2:] -= boxes[:, :2]
+                    for label in np.unique(labels):
+                        selected = labels == label
+                        detections = np.column_stack((boxes[selected], scores[selected])).tolist()
+                        writers[CLASSES[int(label)]].write(json.dumps(
+                            dict(image_id=entry['id'], detections=detections)) + '\n')
+                    timing['prediction_write_s'] += time.perf_counter()-tick
+                    if (index + 1) % 500 == 0:
+                        log('{}: {}/{} images'.format(variant, index + 1, len(image_ids)))
+            tick = time.perf_counter()
+            per_class = {c: evaluate_category(gt, temp / (str(name_ids[c]) + '.jsonl'),
+                                              image_ids, name_ids[c], [100])[100]['ap50']
+                         for c in CLASSES}
+            fold_metrics = [ap_summary({c: evaluate_category(
+                gt, temp / (str(name_ids[c]) + '.jsonl'), ids, name_ids[c], [100])[100]['ap50']
+                for c in CLASSES}) for ids in folds]
+            timing['coco_eval_s'] = time.perf_counter()-tick
+        timing['variant_wall_s'] = time.perf_counter()-variant_started
+        timing['cached_replay_s'] = sum(timing[key] for key in
+                                       ('cache_read_s', 'selection_fusion_nms_s', 'prediction_write_s'))
+        timing['selection_fusion_nms_ms_per_image'] = 1000*timing['selection_fusion_nms_s']/len(image_ids)
+        result = ap_summary(per_class)
+        base, novel = result['base_ap50'], result['novel_ap50']
+        result.update(predictions=count, images=len(image_ids), folds=fold_metrics, timing=timing)
+        summaries[variant] = result
+        write_json(out / (variant + '.json'), result)
+        control = summaries[prefix + 'yolo_candidates']['novel_ap50']
+        row = dict(variant=variant, model=name or 'yolo', multiplier=multiplier,
+                   ranking=ranking, requested_k=k, max_per_img=max_per_img,
+                   mean_actual_k=float(np.mean(actual_ks)),
+                   min_actual_k=int(min(actual_ks)), max_actual_k=int(max(actual_ks)),
+                   images_below_requested_k=sum(v < k for v in actual_ks) if k is not None else 0,
+                   novel_lambda=float(lam), Base_AP50=100*base, Novel_AP50=100*novel,
+                   HM=100*result['hm'], delta_vs_candidates_pp=100*(novel-control),
+                   delta_vs_reference_pp=100*novel-reference_novel,
+                   airport_windmill_positive=per_class['airport'] > 0 and per_class['windmill'] > 0,
+                   predictions=count, images=len(image_ids), full_split=complete)
+        row['passes_reference_and_nonzero'] = (
+            row['Novel_AP50'] > reference_novel and row['airport_windmill_positive'])
+        row.update({c: 100*per_class[c] for c in CLASSES})
+        row.update(timing)
+        rows.append(row)
+        with (out / 'summary.csv').open('w', newline='', encoding='utf-8-sig') as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        write_json(out / 'summary.json', dict(protocol=protocol, rows=rows, variants=summaries,
+                                              completed=len(rows), planned=len(variants)))
+        log('{}: Base={:.4f}, Novel={:.4f}, HM={:.4f}, airport={:.6f}, windmill={:.6f}'.format(
+            variant, 100*base, 100*novel, 100*result['hm'],
+            100*per_class['airport'], 100*per_class['windmill']))
+        log('Cached replay {:.2f}s; COCO {:.2f}s; completed {}/{}.'.format(
+            timing['cached_replay_s'], timing['coco_eval_s'], len(rows), len(variants)))
+    stability = {}
+    for name in models:
+        for multiplier in multipliers:
+            for ranking in rankings:
+                for k in candidate_ks:
+                    group = sorted((row for row in rows if row['model'] == name
+                                    and row['multiplier'] == multiplier and row['ranking'] == ranking
+                                    and row['requested_k'] == k), key=lambda row: row['novel_lambda'])
+                    passing = [row['novel_lambda'] for row in group if row['passes_reference_and_nonzero']]
+                    adjacent = any(group[i]['passes_reference_and_nonzero']
+                                   and group[i + 1]['passes_reference_and_nonzero']
+                                   for i in range(len(group) - 1))
+                    stability['{}/{}/{}/K{}'.format(name, multiplier, ranking, k)] = dict(
+                        passing_lambdas=passing, adjacent_passing_grid_points=adjacent,
+                        interpretation='exploratory full-split grid only; use twofold results for selection')
+    cv = select_twofold(rows, summaries) if cross_validate else None
+    if cv:
+        for row in cv['selections'] + cv['means']:
+            row['max_per_img'] = max_per_img
+        write_json(out / 'twofold.json', dict(protocol=protocol, **cv))
+        write_csv(out / 'twofold_selections.csv', cv['selections'])
+        write_csv(out / 'twofold_means.csv', cv['means'])
+        plot_k_curves(out, cv['means'])
+    timings = dict(preflight_s=protocol['preflight_seconds'], total_wall_s=time.perf_counter()-started,
+                   scope=protocol['timing_scope'], environment=protocol['timing_environment'],
+                   cached_replay_s=sum(row['cached_replay_s'] for row in rows),
+                   coco_eval_s=sum(row['coco_eval_s'] for row in rows))
+    write_json(out / 'timing.json', timings)
+    write_csv(out / 'timing.csv', [{key: row[key] for key in (
+        'variant', 'ranking', 'requested_k', 'max_per_img', 'mean_actual_k', 'images', 'cache_read_s',
+        'selection_fusion_nms_s', 'prediction_write_s', 'cached_replay_s', 'coco_eval_s',
+        'variant_wall_s', 'selection_fusion_nms_ms_per_image')} for row in rows])
+    write_json(out / 'summary.json', dict(protocol=protocol, rows=rows, variants=summaries,
+                                          completed=len(rows), planned=len(variants), stability=stability,
+                                          twofold=cv, timing=timings))
+    with (out / 'summary.txt').open('w', encoding='utf-8') as stream:
+        stream.write(('FULL VAL' if complete else 'PARTIAL SPLIT / SMOKE') +
+                     '; cached candidates; D_B postprocessing; AP50 eval@100; '
+                     'all AP values are percentages.\n')
+        stream.write('Global post-NMS max_per_img={}.\n'.format(max_per_img))
+        stream.write('External reference {} is unverified; inspect the same-candidate YOLO control.\n'.format(reference_novel))
+        if cv:
+            stream.write('Selection: see twofold_means.csv and twofold_selections.csv. '
+                         'Held-out fold means differ from full-val pooled AP. '
+                         'Full-val scores below are exploratory, not selection criteria.\n')
+        for row in rows:
+            stream.write('{}: Novel={:.4f} Base={:.4f} HM={:.4f} airport={:.6f} '
+                         'windmill={:.6f} pass={}\n'.format(
+                             row['variant'], row['Novel_AP50'], row['Base_AP50'],
+                             row['HM'], row['airport'], row['windmill'],
+                             row['passes_reference_and_nonzero']))
+        for key, value in stability.items():
+            stream.write('{}: adjacent passing lambdas={}\n'.format(
+                key, value['adjacent_passing_grid_points']))
+    log('Fusion sweep saved to ' + str(out))
+    log('Cached candidates only; the external reference is unverified. '
+        'Validation sweep gains need independent confirmation.')
+    return summaries
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -434,6 +831,27 @@ def main():
     eval_parser.add_argument('--models', nargs='+', default=['yolo', 'clip', 'remoteclip'],
                              choices=['yolo', 'clip', 'remoteclip'])
     eval_parser.add_argument('--novel-scales', nargs='+', type=float, default=[1.0, .1, .01])
+    fusion_parser = sub.add_parser('evaluate-fusion', aliases=['evaluate-fusion-cv'],
+                                   help='Cached fusion; evaluate-fusion-cv adds two folds and K sweep')
+    fusion_parser.add_argument('--cache-dir', required=True)
+    fusion_parser.add_argument('--models', nargs='+', choices=FUSION_MODELS, default=['clip'])
+    fusion_parser.add_argument('--lambdas', nargs='+', type=float, default=[FIXED_FUSION['novel_lambda']],
+                               help='External weight for Novel; Base stays YOLO. Zero is the shared control.')
+    fusion_parser.add_argument('--multipliers', nargs='+', choices=['objectness', 'yolo_max', 'none'],
+                               default=[FIXED_FUSION['multiplier']])
+    fusion_parser.add_argument('--output-dir', help='New/empty directory; defaults to timestamped cache subdirectory')
+    fusion_parser.add_argument('--ann-file', help='Relocated annotation file; original SHA256 must match')
+    fusion_parser.add_argument('--reference-novel', type=float, default=8.39,
+                               help='Unverified external Novel AP50 reference in percent, for reporting only')
+    fusion_parser.add_argument('--allow-partial', action='store_true', help='Allow incomplete split for smoke tests only')
+    fusion_parser.add_argument('--cpu-threads', type=int, default=4)
+    fusion_parser.add_argument('--candidate-ks', nargs='+', type=int, default=[FIXED_FUSION['k']],
+                               help='Top K cached candidates; fixed default: 100')
+    fusion_parser.add_argument('--rankings', nargs='+', choices=['objectness', 'yolo_max'],
+                               default=[FIXED_FUSION['ranking']], help='Fixed default: yolo_max')
+    fusion_parser.add_argument('--fold-seed', type=int, default=0)
+    fusion_parser.add_argument('--max-per-img', type=int, default=1000,
+                               help='Global post-NMS detection cap; does not change K or AP eval@100.')
     args = parser.parse_args()
     if args.command == 'extract':
         if args.max_images < 0 or args.o_candidates < 1 or args.semantic_candidates < 1:
@@ -445,6 +863,16 @@ def main():
         if args.batch_size < 1 or not 0 < args.context < float('inf'):
             parser.error('Invalid batch size or crop context')
         score(args)
+    elif args.command in ('evaluate-fusion', 'evaluate-fusion-cv'):
+        if args.cpu_threads < 1:
+            parser.error('cpu-threads must be positive.')
+        torch.set_num_threads(args.cpu_threads)
+        cv = args.command == 'evaluate-fusion-cv'
+        evaluate_fusion_cache(args.cache_dir, args.models, args.lambdas, args.multipliers,
+                              args.output_dir, args.ann_file, args.reference_novel, args.allow_partial,
+                              cross_validate=cv, candidate_ks=args.candidate_ks,
+                              rankings=args.rankings,
+                              fold_seed=args.fold_seed, max_per_img=args.max_per_img)
     else:
         if any(not 0 < x < float('inf') for x in args.novel_scales):
             parser.error('Novel scales must be positive and finite')

@@ -1,4 +1,4 @@
-"""Prepare the frozen RemoteCLIP text model used by DIORv2.18.
+"""Prepare the frozen RemoteCLIP text model used by DIORv2.18 and DIORv3.1.
 
 Run from the repository root with the training Python environment. All inputs
 are local; the original checkpoints are left intact. RemoteCLIP's official
@@ -7,11 +7,25 @@ https://github.com/ChenDelong1999/RemoteCLIP#load-remoteclip
 """
 
 import argparse
+import inspect
 from pathlib import Path
 
 import torch
 from transformers import (AutoTokenizer, CLIPTextConfig,
                           CLIPTextModelWithProjection)
+
+
+def load_checkpoint_compat(checkpoint, *, weights_only=True):
+    """Keep conversion usable on older training environments such as torch 1.11.
+
+    Inspect the API before loading: older torch forwards an unknown
+    weights_only keyword to pickle.Unpickler. Do not retry deserialization
+    failures with less restricted loading.
+    """
+    options = dict(map_location='cpu')
+    if 'weights_only' in inspect.signature(torch.load).parameters:
+        options['weights_only'] = weights_only
+    return torch.load(checkpoint, **options)
 
 
 def convert_text_state_dict(source):
@@ -69,7 +83,7 @@ def main():
     if Path(args.detector_checkpoint).resolve() == Path(args.detector_output).resolve():
         raise ValueError('Detector output must not overwrite the original checkpoint.')
 
-    source = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
+    source = load_checkpoint_compat(args.checkpoint, weights_only=True)
     state = convert_text_state_dict(source)
     del source
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
@@ -90,8 +104,7 @@ def main():
 
     # Runner loads this AFTER model construction. Replace its text parameters
     # as well, while preserving every image/neck/head parameter exactly.
-    detector = torch.load(args.detector_checkpoint, map_location='cpu',
-                          weights_only=False)
+    detector = load_checkpoint_compat(args.detector_checkpoint, weights_only=False)
     prefix = 'backbone.text_model.model.'
     text_keys = {key for key in detector['state_dict'] if key.startswith(prefix)}
     expected_keys = {prefix + key for key in state}

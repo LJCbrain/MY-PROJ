@@ -951,7 +951,11 @@ pre_transform = [
     dict(backend_args=None, type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
 ]
-randomness = dict(seed=179871018)
+# Keep the original 2.17 seed for initialization, sampling and data workers.
+# Descendant configs (including 3.11) inherit it. Explicit False values retain
+# the previous MMEngine defaults; fixing the seed does not force deterministic
+# CUDA kernels or change the existing cuDNN benchmark policy.
+randomness = dict(seed=179871018, diff_rank_seed=False, deterministic=False)
 resume = False
 save_epoch_intervals = 2
 strides = [
