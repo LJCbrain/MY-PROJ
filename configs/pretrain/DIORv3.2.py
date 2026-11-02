@@ -4,8 +4,8 @@ Only the opt-in text subclass, full projection and auxiliary loss are new. Keep
 2.17's YOLO image backbone, frozen CLIP, prompt bank, O/OVC, WSR, Base-16
 image-disjoint split and pretrained initialization. No residual or RNR.
 
-The fixed teacher is loaded from the precomputed matrix on the first TRAINING
-forward. With matrix_path=None, encode the manifest once instead. Inference
+The fixed teacher encodes only the Base-16 manifest on the first TRAINING
+forward. An optional base-only offline matrix can replace this step. Inference
 keeps the projection, but needs neither teacher file. Disabling BOTH the
 projection and description loss recovers the original 2.17 computation.
 """
@@ -24,8 +24,8 @@ model = dict(
             prompt_bank_cfg=dict(text_topology_weight=0.0),
             semantic_adapter_cfg=dict(enabled=True, bias=True),
             description_regularization_cfg=dict(
-                description_path='configs/pretrain/dior_v3_2/aerial_descriptions.json',
-                matrix_path='assets/dior_v3_2_description_matrix_v2.pt',
+                description_path='configs/pretrain/dior_v3_2/aerial_descriptions_base16.json',
+                matrix_path=None,
                 loss_weight=0.01,
                 temperature=0.03,
                 topk=3,

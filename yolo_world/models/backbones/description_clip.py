@@ -78,7 +78,7 @@ class DescriptionRegularizedCLIPLanguageBackbone(HuggingCLIPLanguageBackbone):
                 raise ValueError('Description regularization needs a prompt bank '
                                  'and at least three semantic anchor texts.')
             if self.semantic_anchor_sample_size != 0:
-                raise ValueError('DIOR 3.2 requires all-class anchors: sample_size=0.')
+                raise ValueError('DIOR 3.2 requires all base anchors: sample_size=0.')
             if not self.description_path and not self.description_matrix_path:
                 raise ValueError('Provide description_path or matrix_path.')
         # Lazily initialized CPU teacher, deliberately outside EMA/state_dict.

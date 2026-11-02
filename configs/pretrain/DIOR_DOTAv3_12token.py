@@ -77,8 +77,14 @@ DOTA_NOVEL_CLASSES = (
     'swimming-pool',
 )
 DOTA_FULL_CLASSES = DOTA_BASE_CLASSES + DOTA_NOVEL_CLASSES
+# Strict joint OVD: exclude aliases of either dataset's novel classes.
+_joint_novel_keys = {
+    name.lower().replace('-', '').replace(' ', '')
+    for name in DIOR_NOVEL_CLASSES + DOTA_NOVEL_CLASSES
+}
 GUARD_PROMPT_ANCHOR_CLASSES = tuple(
-    dict.fromkeys(DIOR_FULL_CLASSES + DOTA_FULL_CLASSES))
+    name for name in dict.fromkeys(DIOR_BASE_CLASSES + DOTA_BASE_CLASSES)
+    if name.lower().replace('-', '').replace(' ', '') not in _joint_novel_keys)
 
 # hyper-parameters
 num_classes = 20
@@ -146,6 +152,7 @@ model = dict(
                 spatial_temperature=0.1,
                 class_chunk_size=64,
                 orthogonal_key_init=True,
+                train_class_texts=GUARD_PROMPT_ANCHOR_CLASSES,
                 semantic_anchor_texts=GUARD_PROMPT_ANCHOR_CLASSES,
                 semantic_anchor_embed_path=None,
                 semantic_anchor_weight=0.05,

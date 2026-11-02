@@ -20,12 +20,12 @@ from yolo_world.models.layers.description_regularization import (
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--descriptions',
-                        default='configs/pretrain/dior_v3_2/aerial_descriptions.json')
+                        default='configs/pretrain/dior_v3_2/aerial_descriptions_base16.json')
     parser.add_argument('--baseline', default='configs/pretrain/DIORv2.17best.py')
     parser.add_argument('--model-name',
                         default='pretrained_models/clip-vit-large-patch14-336')
     parser.add_argument('--output',
-                        default='assets/dior_v3_2_description_matrix_v2.pt')
+                        default='assets/dior_v3_2_description_matrix_base16.pt')
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--batch-size', type=int, default=20)
     parser.add_argument('--num-threads', type=int, default=4)

@@ -43,7 +43,9 @@ NOVEL_IDS = (1, 3, 10, 19)
 # User-frozen deployment protocol, 2026-10-23. Historical sweeps require
 # explicit CLI overrides; new experiments use this single setting.
 FIXED_FUSION = dict(ranking='yolo_max', k=100, multiplier='none', novel_lambda=.85)
-FUSION_MODELS = ('clip', 'remoteclip', 'clip_roi', 'skyclip_roi', 'remoteclip_roi', 'rn50_roi', 'remoteclip_rn50_roi')
+FUSION_MODELS = ('clip', 'remoteclip', 'clip_roi', 'skyclip_roi', 'remoteclip_roi',
+                 'rn50_roi', 'remoteclip_rn50_roi', 'remoteclip_clip_text',
+                 'remoteclip_prompt_bank_text')
 
 
 def log(message):
@@ -96,6 +98,64 @@ def read_manifest(cache):
     return manifest
 
 
+def apply_detector_ablation(model, ablation):
+    """Disable one trained component after strictly loading the full checkpoint."""
+    if ablation == 'full':
+        return
+    neck = model.neck
+    if ablation in ('no_dual', 'no_dual_fusion'):
+        residual = neck.dual_stream
+        if getattr(residual, 'scale_mode', None) != 'fixed':
+            raise ValueError('no_dual_fusion requires the fixed-scale 2.17 residual.')
+        # Keep the Adapter and its O branch for the same candidate protocol.
+        residual.fixed_scale = 0.0
+    elif ablation == 'no_wsr':
+        if not getattr(neck, 'wsr_enabled', False) or neck.wsr is None:
+            raise ValueError('no_wsr requires an enabled 2.17 WSR.')
+        neck.wsr_enabled = False
+    elif ablation == 'no_prompt_bank':
+        text_model = model.backbone.text_model
+        if not getattr(text_model, 'has_prompt_bank', False):
+            raise ValueError('no_prompt_bank requires an enabled prompt bank.')
+        text_model.prompt_bank = None
+    else:
+        raise ValueError('Unknown detector ablation: ' + str(ablation))
+
+
+def extract_features_with_text(model, inputs, samples, save_text=False):
+    """Observe the existing 2.17 guide/head text forwards without changing them."""
+    if not save_text:
+        return model.extract_feat(inputs, samples), {}
+    text_model = model.backbone.text_model
+    if not getattr(text_model, 'has_prompt_bank', False):
+        raise ValueError('Text comparison requires the full Prompt Bank checkpoint.')
+    captured = []
+
+    def capture(module, arguments, output):
+        captured.append(output[0].detach())
+
+    handle = text_model.register_forward_hook(capture)
+    try:
+        result = model.extract_feat(inputs, samples)
+    finally:
+        handle.remove()
+    prompted, masks = result[1:]
+    if len(captured) != 2 or not torch.equal(captured[-1], prompted):
+        raise RuntimeError('Expected the 2.17 unprompted guide then prompted head text forwards.')
+    if masks is not None and not masks.bool().all():
+        raise ValueError('Text comparison requires all 20 unmasked DIOR categories.')
+    arrays = {}
+    for name, value in zip(('text_clip', 'text_prompt_bank'), (captured[0], prompted)):
+        if value.shape != (1, len(CLASSES), 768) or not torch.isfinite(value).all():
+            raise ValueError('Expected finite 1x20x768 detector text: ' + name)
+        value = value[0].detach().float()
+        if not torch.allclose(value.norm(dim=-1), torch.ones(len(CLASSES), device=value.device),
+                              rtol=1e-4, atol=1e-5):
+            raise ValueError('Detector text must already be L2 normalized: ' + name)
+        arrays[name] = value
+    return result, arrays
+
+
 def extract(args):
     from mmengine.config import Config
     from mmengine.registry import init_default_scope
@@ -115,8 +175,9 @@ def extract(args):
     log('Reading detector checkpoint and original configuration.')
     state = torch.load(str(checkpoint), **options)
     cfg = Config.fromstring(state['meta']['cfg'], '.py')
-    if cfg.model.type != 'YOLOWorldOVCPartialDetector':
-        raise ValueError('Expected a YOLOWorldOVCPartialDetector checkpoint (e.g. DIOR 2.17 or 3.12).')
+    if cfg.model.type not in ('YOLOWorldDetector', 'YOLOWorldOVCPartialDetector'):
+        raise ValueError('Expected a YOLOWorldDetector baseline or '
+                         'YOLOWorldOVCPartialDetector checkpoint.')
     text_cfg = cfg.model.backbone.get('text_model', {})
     if ('semantic_fusion_cfg' in text_cfg
             and not text_cfg['semantic_fusion_cfg'].get('enabled', False)):
@@ -126,12 +187,34 @@ def extract(args):
         evaluators = [evaluators]
     metric = next(v for v in evaluators if v.get('metric') == 'bbox')
     ann_file = str(Path(metric['ann_file']).resolve())
+    has_objectness = (cfg.model.type == 'YOLOWorldOVCPartialDetector'
+                      and cfg.model.neck.get('ovc_enabled', True)
+                      and cfg.model.neck.get('adapter_enabled', True))
     protocol = dict(version=1, checkpoint_sha256=digest(checkpoint),
                     annotation_sha256=digest(ann_file), classes=list(CLASSES),
                     max_images=args.max_images, o_candidates=args.o_candidates,
                     semantic_candidates=args.semantic_candidates,
                     construction='union of clipped-box O-ranked and max-YOLO-score-ranked NMS candidates',
                     selection_uses_gt=False)
+    if not has_objectness:
+        protocol.update(version=2, o_candidates=0, objectness_available=False,
+                        objectness_storage='neutral_ones',
+                        construction='clipped-box max-YOLO-score-ranked NMS candidates only; Adapter/O removed')
+        if cfg.model.type == 'YOLOWorldDetector':
+            protocol['construction'] = (
+                'clipped-box max-YOLO-score-ranked NMS candidates only; '
+                'standard YOLO-World has no Adapter/O')
+    if args.ablation != 'full':
+        protocol['ablation'] = args.ablation
+    save_text = getattr(args, 'save_detector_text_features', False)
+    if save_text:
+        if args.ablation != 'full':
+            raise ValueError('Export detector text using the unchanged full checkpoint.')
+        protocol['detector_text_features'] = dict(
+            keys=['text_clip', 'text_prompt_bank'], shape=[20, 768],
+            source='same detector forward: unprompted neck guide and prompted detection head',
+            backbone_type=text_cfg.get('type', 'unknown'),
+            detector_intervention=False)
     check_protocol(cache / 'extraction_protocol.json', protocol)
     cfg.dump(str(cache / 'source_config.py'))
     register_all_modules()
@@ -141,6 +224,7 @@ def extract(args):
     # EMA deployment weights live in state_dict. Do not load ema_state_dict.
     model.load_state_dict(state['state_dict'], strict=True)
     del state
+    apply_detector_ablation(model, args.ablation)
     model.to(args.device).eval().requires_grad_(False)
     loader_cfg = cfg.val_dataloader.copy()
     loader_cfg.update(batch_size=1, num_workers=0, persistent_workers=False)
@@ -170,29 +254,42 @@ def extract(args):
             if not path.exists():
                 data = model.data_preprocessor(batch, training=False)
                 samples = data['data_samples']
-                feats, texts, masks = model.extract_feat(data['inputs'], samples)
+                (feats, texts, masks), text_arrays = extract_features_with_text(
+                    model, data['inputs'], samples, save_text)
                 model.bbox_head.num_classes = texts.shape[-2]
                 cls, reg = model.bbox_head(feats, texts, masks)
                 boxes, scores = decode_dense(model.bbox_head, cls, reg, samples[0].metainfo)
                 post = model.bbox_head.predict_by_feat(
                     cls, reg, batch_img_metas=[samples[0].metainfo], rescale=True)[0]
-                o_map = model.neck.main_objectness_logits.detach().float().sigmoid()
-                o_scores = torch.cat([F.interpolate(o_map, size=x.shape[-2:], mode='bilinear',
-                                                    align_corners=False).flatten() for x in reg])
+                o_scores = None
+                if has_objectness:
+                    o_map = model.neck.main_objectness_logits.detach().float().sigmoid()
+                    o_scores = torch.cat([F.interpolate(o_map, size=x.shape[-2:], mode='bilinear',
+                                                        align_corners=False).flatten() for x in reg])
                 keep = candidate_indices(boxes, scores, o_scores,
-                                         args.o_candidates, args.semantic_candidates)
+                                         protocol['o_candidates'], args.semantic_candidates)
+                if o_scores is None:
+                    # Schema compatibility only. Protocol records that no O
+                    # signal exists; O ranking/multipliers are rejected below.
+                    o_scores = scores.new_ones(len(scores))
                 arrays = dict(boxes=boxes[keep], yolo_scores=scores[keep],
                               objectness=o_scores[keep], dense_indices=keep,
                               original_boxes=post.bboxes, original_scores=post.scores,
                               original_labels=post.labels)
+                arrays.update(text_arrays)
                 save_npz(path, **{k: v.cpu().numpy() for k, v in arrays.items()})
-                model.neck.clear_auxiliary_cache()
+                clear_cache = getattr(model.neck, 'clear_auxiliary_cache', None)
+                if callable(clear_cache):
+                    clear_cache()
             manifest['images'].append(entry)
             if number == 0 or (number + 1) % 100 == 0:
                 log('Extracted {}/{} images; {:.0f}s'.format(
                     number + 1, min(len(loader), args.max_images or len(loader)),
                     time.monotonic() - start))
     write_json(cache / 'manifest.json', manifest)
+    if getattr(args, 'skip_evaluation', False):
+        log('Candidate cache complete; downstream driver will evaluate its own output cap.')
+        return
     log('Candidate cache complete. Evaluating original detector and candidate controls.')
     summaries = evaluate_cache(cache, ['yolo'], [1.0])
     if args.expected_hm is not None:
@@ -359,6 +456,10 @@ def metric_values(ann_file, image_ids, records, max_dets):
 
 def evaluate_cache(cache, models, scales):
     manifest = read_manifest(cache)
+    if (manifest['protocol'].get('objectness_available') is False
+            and any(model != 'yolo' for model in models)):
+        raise ValueError('Adapter/O is absent. Use evaluate-fusion with '
+                         '--rankings yolo_max --multipliers none.')
     if digest(manifest['ann_file']) != manifest['protocol']['annotation_sha256']:
         raise ValueError('Annotation file changed since extraction')
     cats = load_json(manifest['ann_file'])['categories']
@@ -550,6 +651,10 @@ def evaluate_fusion_cache(cache, models, lambdas, multipliers, output_dir=None,
         raise ValueError('Reference Novel AP50 must be a percentage in [0, 100].')
     manifest = read_manifest(cache)
     extraction = manifest['protocol']
+    if (extraction.get('objectness_available') is False
+            and ('objectness' in rankings or 'objectness' in multipliers)):
+        raise ValueError('Adapter/O is absent; objectness ranking/multipliers are unavailable. '
+                         'Use --rankings yolo_max --multipliers none.')
     if extraction.get('classes') != list(CLASSES) or extraction.get('selection_uses_gt') is not False:
         raise ValueError('Cache must declare DIOR class order and GT-free candidate selection.')
     annotation = Path(ann_file or manifest['ann_file']).resolve()
@@ -812,6 +917,13 @@ def main():
     extract_parser.add_argument('--max-images', type=int, default=0)
     extract_parser.add_argument('--o-candidates', type=int, default=300)
     extract_parser.add_argument('--semantic-candidates', type=int, default=100)
+    extract_parser.add_argument('--save-detector-text-features', action='store_true',
+                                help='Export original CLIP and Prompt Bank head text from the same forward; use a new cache.')
+    extract_parser.add_argument('--ablation',
+                                choices=['full', 'no_dual', 'no_dual_fusion', 'no_wsr', 'no_prompt_bank'],
+                                default='full',
+                                help='Inference-only intervention. no_dual is the legacy alias for '
+                                     'no_dual_fusion (keeps Adapter/O). Retrained ablations use full.')
     extract_parser.add_argument('--expected-hm', type=float, default=None,
                                 help='Expected original HM in percent; full validation only')
     extract_parser.add_argument('--hm-tolerance', type=float, default=.1,

@@ -43,10 +43,9 @@ model = dict(
     backbone=dict(
         text_model=dict(
             prompt_bank_cfg=dict(
-                semantic_anchor_texts=XVIEW_FULL_CLASSES,
-                semantic_anchor_embed_path=(
-                    'data/xView800/clip_vit_large_patch14_336_'
-                    'xview60_text_embeddings.pt')))),
+                train_class_texts=XVIEW_BASE_CLASSES,
+                semantic_anchor_texts=XVIEW_BASE_CLASSES,
+                semantic_anchor_embed_path=None))),
     bbox_head=dict(
         head_module=dict(num_classes=num_training_classes)),
     train_cfg=dict(assigner=dict(num_classes=num_training_classes)))

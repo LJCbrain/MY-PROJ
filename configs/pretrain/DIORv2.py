@@ -100,10 +100,9 @@ model = dict(
                 use_reliability=True,
                 loss_match_weight=0.7,
                 loss_orthogonal_weight=0.3,
-                semantic_anchor_texts=DIOR_FULL_CLASSES,
-                semantic_anchor_embed_path=(
-                    'data/DIOR/clip_vit_large_patch14_336_'
-                    'dior20_text_embeddings.pt'),
+                train_class_texts=DIOR_BASE_CLASSES,
+                semantic_anchor_texts=DIOR_BASE_CLASSES,
+                semantic_anchor_embed_path=None,
                 semantic_anchor_weight=0.05,
                 semantic_anchor_warmup_iters=1000))),
     neck=dict(

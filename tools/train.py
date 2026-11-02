@@ -21,6 +21,7 @@ if proj_root not in sys.path:  # 若项目根目录不在模块搜索路径中
     # Copyright (c) OpenMMLab. All rights reserved.  # 版权声明（上游项目 OpenMMLab）
 import argparse  # 导入 argparse：用于解析命令行参数
 import logging  # 导入 logging：用于日志级别/日志输出相关
+from yolo_world.training_vocabulary import validate_training_vocabulary
 
 
 from mmengine.config import Config, DictAction  # 从 mmengine 导入 Config/DictAction：用于读取配置与解析 key=val 覆盖
@@ -80,6 +81,7 @@ def main():  # 定义主入口函数
     cfg.launcher = args.launcher  # 将 launcher 写入配置：Runner 构建时会使用
     if args.cfg_options is not None:  # 若有通过命令行传入 cfg 覆盖项
         cfg.merge_from_dict(args.cfg_options)  # 将覆盖项合并进 cfg（优先级高于文件内默认）
+    validate_training_vocabulary(cfg)
     # work_dir is determined in this priority: CLI > segment in file > filename  # 注释：work_dir 优先级：CLI > 配置段 > 配置文件名
     if args.work_dir is not None:  # 若命令行显式指定了 work_dir
         # update configs according to CLI args if args.work_dir is not None  # 注释：根据 CLI 更新配置

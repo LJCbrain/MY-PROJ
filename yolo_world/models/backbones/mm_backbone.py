@@ -12,6 +12,7 @@ from mmyolo.registry import MODELS
 from mmdet.utils import OptMultiConfig, ConfigType
 from transformers import (AutoTokenizer, AutoModel, CLIPTextConfig)
 from transformers import CLIPTextModelWithProjection as CLIPTP
+from yolo_world.training_vocabulary import canonical_class_name
 
 
 def text_topology_kl_loss(prompted_embeddings: Tensor,
@@ -785,6 +786,9 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         self._prompt_bank_losses = {}
         self._last_base_text_features = None
         self.semantic_anchor_texts = ()
+        # None preserves unrestricted pretraining. OVD configs explicitly
+        # provide the base-only vocabulary, independently of the anchors.
+        self.train_class_texts = None
         self.semantic_anchor_embed_path = None
         self.semantic_anchor_weight = 0.0
         self.semantic_anchor_warmup_iters = 0
@@ -799,6 +803,16 @@ class HuggingCLIPLanguageBackbone(BaseModule):
             persistent=False)
         if prompt_bank_cfg is not None:
             prompt_bank_cfg = dict(prompt_bank_cfg)
+            train_texts = prompt_bank_cfg.pop('train_class_texts', None)
+            if train_texts is not None:
+                if (not train_texts or isinstance(train_texts, str) or
+                        any(not isinstance(t, str) or not t.strip()
+                            for t in train_texts)):
+                    raise ValueError('train_class_texts must be non-empty class names.')
+                self.train_class_texts = frozenset(train_texts)
+            self._validate_training_texts(
+                prompt_bank_cfg.get('semantic_anchor_texts', ()),
+                'semantic_anchor_texts')
             enabled = prompt_bank_cfg.pop('enabled', True)
             if enabled:
                 self.semantic_anchor_texts = tuple(
@@ -844,15 +858,31 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         return self.model(**text_inputs).text_embeds
 
     def forward_tokenizer(self, texts):
-        if not hasattr(self, 'text'):
-            text = list(itertools.chain(*texts))#列表扁平化
+        flat_texts = tuple(itertools.chain(*texts))
+        self._validate_training_texts(flat_texts, 'batch texts')
+        if getattr(self, '_tokenized_texts', None) != flat_texts:
+            text = list(flat_texts)
             text = self.tokenizer(text=text, return_tensors='pt', padding=True)
             self.text = text.to(device=self.text_device)
+            self._tokenized_texts = flat_texts
         return self.text
 
     @property
     def has_prompt_bank(self) -> bool:
         return self.prompt_bank is not None
+
+    def _validate_training_texts(self, texts, source):
+        """Reject unseen text before tokenization, including frozen paths."""
+        if not self.training or self.train_class_texts is None:
+            return
+        allowed = {canonical_class_name(t) for t in self.train_class_texts}
+        unexpected = {t for t in texts if t != self.pad_value and
+                      canonical_class_name(t) not in allowed}
+        if unexpected:
+            raise ValueError(
+                f'OVD training vocabulary violation in {source}: '
+                f'{sorted(unexpected)}. Only train_class_texts are allowed; '
+                'novel classes are evaluation-only.')
 
     def forward(self,
                 text: List[List[str]],
@@ -866,6 +896,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         batch_size = len(text)
         num_classes = num_per_batch[0]
         flat_texts = list(itertools.chain(*text))
+        self._validate_training_texts(flat_texts, 'batch texts')
         valid_text_mask = torch.tensor(
             [x != self.pad_value for x in flat_texts],
             device=self.text_device,
@@ -1040,7 +1071,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         prompted_embeddings = F.normalize(prompted_embeddings, dim=-1)
         prompted_embeddings = prompted_embeddings.reshape(
             batch_size, anchor_count, -1)
-        original_embeddings = original_embeddings.to(
+        original_embeddings = self._get_prompt_anchor_embeddings()[anchor_indices].to(
             device=prompted_embeddings.device,
             dtype=prompted_embeddings.dtype)
         if self.semantic_anchor_weight > 0:
@@ -1057,7 +1088,13 @@ class HuggingCLIPLanguageBackbone(BaseModule):
             self._prompt_bank_losses['loss_text_topology'] = (
                 topology_loss * self.text_topology_weight)
 
+    def _get_prompt_anchor_embeddings(self) -> Tensor:
+        """Reference in the prompted encoder's output space; normally the guide."""
+        return self._get_semantic_anchor_embeddings()
+
     def _get_semantic_anchor_embeddings(self) -> Tensor:
+        self._validate_training_texts(self.semantic_anchor_texts,
+                                      'semantic_anchor_texts')
         if self._semantic_anchor_embeddings is not None:
             return self._semantic_anchor_embeddings
 
@@ -1066,6 +1103,12 @@ class HuggingCLIPLanguageBackbone(BaseModule):
                 os.path.isfile(self.semantic_anchor_embed_path)):
             payload = torch.load(
                 self.semantic_anchor_embed_path, map_location='cpu')
+            if self.train_class_texts is not None and (
+                    not isinstance(payload, dict) or
+                    tuple(payload.get('texts', ())) != self.semantic_anchor_texts):
+                raise ValueError(
+                    'OVD semantic anchor tables must include the exact '
+                    'base-only texts; rebuild the offline table.')
             if isinstance(payload, dict):
                 saved_texts = tuple(payload.get('texts', ()))
                 if saved_texts and saved_texts != self.semantic_anchor_texts:

@@ -3,20 +3,20 @@
 3.2新增完整映射的Semantic Adapter及文本描述关系损失，不实现RNR，
 不改O分支，不替换图像骨干。Adapter不是O/OVC的Visual Adapter。
 配置直接继承 `configs/pretrain/DIORv2.17best.py`，不是继承3.0或3.1。
-原2.17配置、模型类、公共模块的注册入口均不修改。
+2026-10-28 协议修正：2.17及继承配置的训练锚点均限制为基类；旧实验结果不代表修正后的协议。
 新文本子类仅由3.2的 `custom_imports` 注册；不导入公共 `__init__.py`。
 描述源文件和说明放在专属 `configs/pretrain/dior_v3_2/` 目录，避免被
 仓库现有的 `assets/`、`docs/` 忽略规则排除。生成的 `.pt` 矩阵是可重建缓存，
-按现有权重文件规则被Git忽略；换机器时先执行下面的生成命令。
+按现有权重文件规则被Git忽略；默认首次训练前向自动编码基类描述，也可提前生成缓存。
 
 ## 方法与边界
 
-20类通用航空外观描述 → 冻结CLIP → 原始20×20余弦关系矩阵。
+16个基类航空外观描述 → 冻结CLIP → 原始16×16余弦关系矩阵。
 排除自身的行softmax只在计算损失时应用，初始温度0.03。
 每类选择最多3个最相似邻居与3个最不相似邻居，使用两组的笛卡尔积
 构造确定性三元组；不是原论文的随机采样复现，不额外消耗训练RNG。
 自适应间隔为两个邻居的教师关系概率之差；全批次及有效三元组取均值。
-学生是提示后CLIP文本经共享Semantic Adapter得到的 `[B,20,768]` 分类原型。
+学生是提示后CLIP文本经共享Semantic Adapter得到的 `[B,16,768]` 基类原型。
 实际检测头使用同一个Adapter的输出，而不是另建仅用于辅助损失的投影器。
 
 检测文本链路为：类别名称 → PromptBank + 冻结CLIP → 归一化文本向量e
@@ -24,7 +24,7 @@
 Adapter为单层768→768全连接，共590,592个可训练参数；Xavier随机初始化权重、
 零偏置。没有残差、门控、原向量直通或恒等初始化，允许完整重塑语义空间。
 随机映射可能降低初始预训练对齐，这是本次完整映射实验需要实测的代价。
-输入类别数不写死：Base16训练、全部20类关系学习、全部20类推理共享W和b。
+输入类别数不写死：Base16训练和关系学习、全部20类推理共享W和b。
 未提示的冻结CLIP向量仍用于neck引导和PromptBank路由，不经过Adapter。
 
 总损失为2.17原损失加 `loss_text_description`。单点语义锚定保持0.05，
@@ -37,65 +37,44 @@ CLIP冻结；Base分类损失直接训练新Adapter，也沿原检测链路训�
 新Adapter显式设置 `lr_mult=1.0`，实际初始LR=0.001，避免继承整个文本骨干的
 0.01倍学习率；其他优化器设置保持2.17。训练仍是一阶段联合学习，没有新增冻结阶段。
 
-检测分类训练仍为Base16；Novel4只参与文本关系约束，不作为新增检测负类。
-描述不替换类别名称、不直接重加权分类分数。它不是Novel视觉监督，
-也不保证消除Novel→Base错分。已知目标词表的ZSD协议应明确披露。
+检测分类、语义锚定、文本拓扑和描述关系损失均只使用Base16。
+Novel4名称和描述只可用于验证/测试，不能进入训练编码器或教师关系矩阵。
+冻结CLIP不能消除通过新类文本训练提示词或Adapter的泄漏。
 不得根据目标测试图片、预测或指标反复编辑描述或调参。
 
 ## 描述版本
 
-当前默认老师为 `v2_appearance_review`：20类描述统一为航空可见轮廓、
-组成部件和内部布局，主体类别写单体，设施类别写整体布局。
-老师描述不直接包含类别名称；检测器类别名称和语义锚定目标不变。
-细小线条、顶部开口、阴影等不稳定信息使用条件表述，不作为必需特征。
-来源、逐类改写理由及验收边界见同目录 `DESCRIPTION_REVIEW_V2.md`。
-
-`aerial_descriptions_v1.json` 按字节保留原版描述；原缓存
-`assets/dior_v3_2_description_matrix.pt` 不覆盖。当前描述仍放在
-`aerial_descriptions.json`，新缓存独立为
-`assets/dior_v3_2_description_matrix_v2.pt`。
-这是按论文原则审校的候选老师，不等于已经证明提升检测效果。
+当前训练源为 `aerial_descriptions_base16.json`，只保留v2中的16个基类描述，
+版本为 `v2_appearance_review_base16`。旧的 `aerial_descriptions.json`、
+`aerial_descriptions_v1.json` 和20类矩阵仅作历史存档，不得接入当前训练。
+加载器要求类别集合严格一致，不会静默裁剪旧20类教师。
+候选描述尚不代表已经证明提升检测效果。
 
 ## 生成矩阵与运行
 
 从仓库根目录执行，使用已有YOLO-World训练环境。编码器只读本地权重，
 不下载模型、不读取任何图像或数据集标注。描述太长会报错，不静默截断。
-本工作区已生成矩阵，可直接训练；生成命令用于新工作区或缓存缺失时。
+默认 `matrix_path=None`，无需预先生成矩阵；首次训练前向只编码16个基类描述。
 
 ```powershell
 python tools/build_dior_description_matrix.py --device cpu
 python tools/train.py --config configs/pretrain/DIORv3.2.py --work-dir work_dirs/DIORv3.2_semantic_full
 ```
 
-训练命令必须显式设置 `--work-dir`：现有公共训练脚本有非空默认目录，
-否则会覆盖配置里的3.2输出目录。
+如需离线缓存，生成后显式指定新的Base16路径：
+
+```powershell
+python tools/train.py --config configs/pretrain/DIORv3.2.py --work-dir work_dirs/DIORv3.2_base16 --cfg-options model.backbone.text_model.description_regularization_cfg.matrix_path=assets/dior_v3_2_description_matrix_base16.pt
+```
+
 矩阵保存原始余弦、类别名、描述和源文件SHA256。加载时按名字重排两轴，
-类别缺失、重复、矩阵不对称或描述文件校验和变化都会报错。
-修改描述后优先用 `--output` 生成新的版本路径并同步3.2配置；
-只有有意重建同一缓存时才使用 `--force`。必须开启新实验目录，
-不要将新老师接入正在进行的训练，也不要用旧描述训练的检查点直接resume。
-不要覆盖2.17模型或旧实验输出。
+类别缺失、额外类别、重复、矩阵不对称或校验和变化都会报错。
+必须使用新实验目录和原始预训练初始化，不能从已见过Novel文本的实验检查点resume。
+已有训练权重的泄漏无法通过删除文本或缓存逆转，旧结果需要重新训练和评估。
+推理不读取描述或矩阵、不计算关系损失，但保留Adapter完整映射。
+教师缓存不进入EMA/state_dict，warmup整数计数器进入检查点。
 
-需要回到v1做文本版本消融时，用独立目录，同时覆盖两个路径：
-
-```powershell
-python tools/train.py --config configs/pretrain/DIORv3.2.py --work-dir work_dirs/DIORv3.2_semantic_full_desc_v1 --cfg-options model.backbone.text_model.description_regularization_cfg.description_path=configs/pretrain/dior_v3_2/aerial_descriptions_v1.json model.backbone.text_model.description_regularization_cfg.matrix_path=assets/dior_v3_2_description_matrix.pt
-```
-
-新机器缺少v1缓存时，先生成它：
-
-```powershell
-python tools/build_dior_description_matrix.py --descriptions configs/pretrain/dior_v3_2/aerial_descriptions_v1.json --output assets/dior_v3_2_description_matrix.pt --device cpu
-```
-
-如不想保存离线矩阵，可用配置覆盖 `matrix_path=None`，在首次训练前向
-用同一个冻结CLIP编码全部描述并缓存CPU矩阵。这个编码只执行一次。
-推理不读取描述或矩阵、不计算关系损失，但保留新Adapter的一次完整映射。
-新Adapter权重进入检查点和EMA；不能在推理时禁用它，否则改变分类语义空间。
-教师缓存不进入EMA/state_dict，独立warmup整数计数器进入3.2检查点。
-当前3.2默认读取已生成的离线矩阵；自动编码是显式关闭matrix_path后的替代路径。
-
-## 随机种子来源
+## 历史随机种子来源（不代表修正后的实验结果）
 
 3.2显式固定 `randomness=dict(seed=179871018)`，与2.17取得HM约14.3%的
 实际运行一致，不只根据当前baseline配置推测。核对日志为
@@ -140,6 +119,8 @@ python tools/validate_ovc.py --config configs/pretrain/DIORv3.2.py --device cpu 
 `semantic_adapter_grad_norms`、`semantic_adapter_learning_rates` 和
 `inference_semantic_adapter_shapes`，分别验证真实参数更新、梯度、LR与20类推理。
 旧提示词关系版本的检查结果不能充当新Adapter的验证结果。
+
+以下为协议修正前的历史验收，不能作为Base16版本的验收：
 
 2026-10-10验收：21项描述/Adapter测试和3项原拓扑测试通过；完整预训练
 检测器在两张真实Base训练图片上以CPU、128×128、两步更新通过。

@@ -32,7 +32,8 @@ model = dict(
     backbone=dict(
         text_model=dict(
             prompt_bank_cfg=dict(
-                semantic_anchor_texts=DOTA_FULL_CLASSES))),
+                train_class_texts=DOTA_BASE_CLASSES,
+                semantic_anchor_texts=DOTA_BASE_CLASSES))),
     bbox_head=dict(
         head_module=dict(num_classes=num_training_classes)),
     train_cfg=dict(assigner=dict(num_classes=num_training_classes)))

@@ -11,11 +11,26 @@ from ..layers.ovc_layers import (DualSourceWeakSupportRetriever, OVCResidual,
                                  VisualObjectAdapter)
 
 
+class _DisabledDualStream(torch.nn.Module):
+    """Pass P3 through while retaining the interface used by OVC training."""
+
+    def __init__(self):
+        super().__init__()
+        # The OVC optimizer reads out_proj.parameters().
+        self.out_proj = torch.nn.Identity()
+        self.scale_mode = 'disabled'
+        self.collect_diagnostics = False
+        self.last_diagnostics = {}
+
+    def forward(self, semantic, *args):
+        return semantic
+
+
 @MODELS.register_module()
 class OVCYOLOWorldWSRPAFPN(SemanticDualStreamYOLOWorldWSRPAFPN):
     def __init__(self, *args, ovc_enabled=True, adapter_enabled=True,
                  objectness_reweight=True, context_floor=0.25,
-                 dual_stream_cfg=None, wsr_enabled=True,
+                 dual_stream_cfg=None, dual_stream_enabled=True, wsr_enabled=True,
                  text_cross_attn_cfg=None, dsg_cfg=None, **kwargs):
         if not ovc_enabled:
             legacy_wsr = dict(kwargs.get('wsr_cfg') or {})
@@ -34,13 +49,16 @@ class OVCYOLOWorldWSRPAFPN(SemanticDualStreamYOLOWorldWSRPAFPN):
             self.wsr = None
         self.ovc_enabled = ovc_enabled
         self.adapter_enabled = adapter_enabled and ovc_enabled
+        self.dual_stream_enabled = bool(dual_stream_enabled)
         if (self.ovc_enabled and self.wsr_enabled
                 and not isinstance(self.wsr, DualSourceWeakSupportRetriever)):
             raise ValueError('OVC requires DualSourceWeakSupportRetriever.')
         if (self.ovc_enabled and self.wsr_enabled
                 and not self.adapter_enabled and self.wsr.num_visual_tokens):
             raise ValueError('Visual support slots require an Adapter.')
-        if self.adapter_enabled:
+        # Also construct then remove the whole ablated branch to preserve the
+        # initialization RNG stream of the remaining modules under the same seed.
+        if self.adapter_enabled or (self.ovc_enabled and not self.dual_stream_enabled):
             cfg = dict(hidden_channels=64, norm_groups=8, residual_scale=0.1,
                        learnable_scale=True)
             cfg.update(dual_stream_cfg or {})
@@ -52,6 +70,12 @@ class OVCYOLOWorldWSRPAFPN(SemanticDualStreamYOLOWorldWSRPAFPN):
                 semantic_channels=p3, visual_channels=c3,
                 objectness_reweight=objectness_reweight,
                 context_floor=context_floor, **cfg)
+            if not self.adapter_enabled:
+                del self.visual_adapter
+        if not self.dual_stream_enabled:
+            # Construct the original branch first to preserve the seed's
+            # initialization order for all other modules, then remove it.
+            self.dual_stream = _DisabledDualStream()
         self.main_visual = self.main_objectness_logits = None
         self.last_visual_scores = None
         self.last_support_features = None

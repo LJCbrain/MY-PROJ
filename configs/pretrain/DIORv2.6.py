@@ -62,7 +62,7 @@ DIOR_FULL_CLASSES = (
     'windmill',
 )
 
-GUARD_PROMPT_ANCHOR_CLASSES = DIOR_FULL_CLASSES
+GUARD_PROMPT_ANCHOR_CLASSES = DIOR_BASE_CLASSES
 
 # hyper-parameters
 num_classes = 20
@@ -131,7 +131,8 @@ model = dict(
                 # These statistics are diagnostic only.  Keeping them off
                 # also avoids eigvalsh failures on repeated QR eigenvalues.
                 collect_key_stats=False,
-                semantic_anchor_texts=GUARD_PROMPT_ANCHOR_CLASSES,
+                train_class_texts=DIOR_BASE_CLASSES,
+                semantic_anchor_texts=DIOR_BASE_CLASSES,
                 semantic_anchor_embed_path=None,
                 semantic_anchor_weight=0.05,
                 semantic_anchor_warmup_iters=1000,

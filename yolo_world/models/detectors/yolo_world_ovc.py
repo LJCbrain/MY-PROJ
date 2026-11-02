@@ -109,7 +109,7 @@ class YOLOWorldOVCDetector(YOLOWorldDetector):
 
 @MODELS.register_module()
 class YOLOWorldOVCPartialDetector(YOLOWorldOVCDetector):
-    """Attach O-ranked, class-agnostic proposals without a second image pass."""
+    """Attach O-ranked proposals, or YOLO-ranked proposals when Adapter is off."""
     def __init__(self, *args, clip_roi_cfg=None, **kwargs):
         super().__init__(*args, **kwargs)
         from ..layers.clip_roi import clip_roi_config
@@ -132,6 +132,7 @@ class YOLOWorldOVCPartialDetector(YOLOWorldOVCDetector):
 
     def predict(self, batch_inputs, batch_data_samples, rescale=True):
         enabled = self.clip_roi_cfg['enabled']
+        has_objectness = getattr(self.neck, 'adapter_enabled', False)
         if enabled:
             if not rescale:
                 raise ValueError('CLIP RoI requires rescale=True (original-image boxes).')
@@ -141,7 +142,7 @@ class YOLOWorldOVCPartialDetector(YOLOWorldOVCDetector):
         capture = {}
         def capture_dense(module, args, output):
             capture['boxes'] = output[1]
-            if enabled:
+            if enabled or not has_objectness:
                 capture['classes'] = output[0]
         handle = self.bbox_head.register_forward_hook(
             capture_dense)
@@ -149,13 +150,21 @@ class YOLOWorldOVCPartialDetector(YOLOWorldOVCDetector):
             results = super().predict(batch_inputs, batch_data_samples, rescale=rescale)
         finally:
             handle.remove()
-        objectness = self.neck.main_objectness_logits.detach().float().sigmoid()
         boxes = capture['boxes']
+        objectness = None
+        if has_objectness:
+            objectness = self.neck.main_objectness_logits.detach().float().sigmoid()
+            proposal_scores = [objectness] * len(boxes)
+        else:
+            proposal_scores = [cls.detach().float().sigmoid().amax(1, keepdim=True)
+                               for cls in capture['classes']]
         proposals = self.bbox_head.predict_proposals_by_feat(
-            boxes, [objectness] * len(boxes),
+            boxes, proposal_scores,
             [sample.metainfo for sample in results], rescale=rescale)
         for sample, proposal in zip(results, proposals):
             sample.proposal_instances = proposal
+            sample.set_metainfo(dict(proposal_score_source=(
+                'objectness' if has_objectness else 'yolo_max')))
         if enabled:
             sync(batch_inputs.device)
             detector_s = time.perf_counter() - start
@@ -169,7 +178,8 @@ class YOLOWorldOVCPartialDetector(YOLOWorldOVCDetector):
                     self.bbox_head,
                     [x[index:index+1] for x in capture['classes']],
                     [x[index:index+1] for x in boxes],
-                    objectness[index:index+1], sample.metainfo, batch_inputs.device)
+                    objectness[index:index+1] if objectness is not None else None,
+                    sample.metainfo, batch_inputs.device)
                 sample.pred_instances = prediction
                 self.last_clip_roi_timings.append(timing)
                 if self.last_clip_roi_debug is not None:
